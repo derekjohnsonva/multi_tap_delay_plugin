@@ -2,7 +2,7 @@
 
 _PR-sized breakdown of the work described in [design_document.md](./design_document.md). Each PR is independently reviewable, leaves the project in a building/loadable state, and is ordered so later PRs build on earlier ones._
 
-> **Progress:** Phase 0 (PR 1) and Phase 1 (PR 2–6) are ✅ **done** — workspace scaffolded, `delay-core` engine implemented with 20 passing unit tests, and the CLAP + VST3 passthrough bundle builds via `cargo xtask bundle`. Next up: Phase 2 (lane/curve model). Manual DAW load (Reaper/Bitwig) of the bundle still wants a human ear.
+> **Progress:** Phase 0 (PR 1), Phase 1 (PR 2–6), and Phase 2 (PR 7–10) are ✅ **done** — workspace scaffolded, `delay-core` engine + lane/curve model implemented with 41 passing unit tests, and the CLAP + VST3 passthrough bundle builds via `cargo xtask bundle`. Next up: Phase 3 (nih-plug params + wiring the lane model into the engine). Manual DAW load (Reaper/Bitwig) of the bundle still wants a human ear.
 
 ---
 
