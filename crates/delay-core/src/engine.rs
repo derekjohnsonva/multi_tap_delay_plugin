@@ -1,0 +1,269 @@
+//! PR 3/4/6 — The multi-tap engine.
+//!
+//! One stereo delay buffer, N read taps. Each tap reads at a fractional delay,
+//! is collapsed to mono, scaled by a (smoothed) gain, and equal-power panned
+//! into the stereo field. The summed wet signal is crossfaded against the dry
+//! input by `mix` and scaled by `output_trim` (design doc §4).
+//!
+//! No feedback ⇒ unconditionally stable ⇒ arbitrary per-tap gains are safe.
+
+use crate::buffer::DelayLine;
+use crate::pan::equal_power;
+use crate::smoothing::OnePole;
+
+/// A target configuration for one tap. This is the plain-data description the
+/// host/GUI hands to the engine; the engine keeps its own smoothed copy.
+#[derive(Clone, Copy, Debug)]
+pub struct Tap {
+    /// Read position in samples (fractional allowed).
+    pub delay_samples: f32,
+    /// Linear amplitude. `0..1` normally; negative flips polarity (advanced).
+    pub gain: f32,
+    /// Pan position, `-1.0` (hard L) .. `+1.0` (hard R).
+    pub pan: f32,
+}
+
+impl Tap {
+    pub fn new(delay_samples: f32, gain: f32, pan: f32) -> Self {
+        Self {
+            delay_samples,
+            gain,
+            pan,
+        }
+    }
+}
+
+/// Internal per-tap state: the target plus smoothers for the coefficients that
+/// would otherwise zipper (gain, pan). Delay time is not smoothed here — time
+/// modulation is a future lane (design doc §8); changing it abruptly is fine
+/// for now because taps only modulate amplitude.
+struct TapState {
+    delay_samples: f32,
+    gain: OnePole,
+    pan: OnePole,
+}
+
+/// The multi-tap delay engine. Allocate once with [`Engine::new`]; all
+/// per-sample work is allocation-free.
+pub struct Engine {
+    sample_rate: f32,
+    left: DelayLine,
+    right: DelayLine,
+    taps: Vec<TapState>,
+    mix: OnePole,
+    output_trim: OnePole,
+    smoothing_ms: f32,
+}
+
+impl Engine {
+    /// Create an engine. `max_delay_samples` bounds the longest tap time.
+    pub fn new(sample_rate: f32, max_delay_samples: usize) -> Self {
+        let mut mix = OnePole::new(1.0);
+        let mut output_trim = OnePole::new(1.0);
+        let smoothing_ms = 20.0;
+        mix.set_time(smoothing_ms, sample_rate);
+        output_trim.set_time(smoothing_ms, sample_rate);
+        Self {
+            sample_rate,
+            left: DelayLine::new(max_delay_samples),
+            right: DelayLine::new(max_delay_samples),
+            taps: Vec::new(),
+            mix,
+            output_trim,
+            smoothing_ms,
+        }
+    }
+
+    /// Clear all audio state (buffers + smoother positions snap to target).
+    pub fn reset(&mut self) {
+        self.left.reset();
+        self.right.reset();
+        for t in &mut self.taps {
+            t.gain.set_immediate(t.gain.value());
+            t.pan.set_immediate(t.pan.value());
+        }
+    }
+
+    /// Set the per-coefficient smoothing time (ms) for gain, pan and mix.
+    pub fn set_smoothing_ms(&mut self, time_ms: f32) {
+        self.smoothing_ms = time_ms;
+        for t in &mut self.taps {
+            t.gain.set_time(time_ms, self.sample_rate);
+            t.pan.set_time(time_ms, self.sample_rate);
+        }
+        self.mix.set_time(time_ms, self.sample_rate);
+        self.output_trim.set_time(time_ms, self.sample_rate);
+    }
+
+    /// Dry/wet balance, `0.0` (dry only) .. `1.0` (wet only).
+    pub fn set_mix(&mut self, mix: f32) {
+        self.mix.set_target(mix.clamp(0.0, 1.0));
+    }
+
+    /// Linear output gain applied after the dry/wet mix.
+    pub fn set_output_trim(&mut self, gain: f32) {
+        self.output_trim.set_target(gain.max(0.0));
+    }
+
+    /// Number of active taps.
+    pub fn num_taps(&self) -> usize {
+        self.taps.len()
+    }
+
+    /// Replace the tap set. Existing taps (by index) keep their smoother state
+    /// so gain/pan ramp from where they were; appended taps fade in from gain
+    /// 0 to avoid a click. Removal is currently abrupt — graceful crossfade-out
+    /// on tap-count decrease is handled by the lane model (PR 10, Phase 2).
+    pub fn set_taps(&mut self, taps: &[Tap]) {
+        // Update or grow.
+        for (i, tap) in taps.iter().enumerate() {
+            if let Some(state) = self.taps.get_mut(i) {
+                state.delay_samples = tap.delay_samples;
+                state.gain.set_target(tap.gain);
+                state.pan.set_target(tap.pan);
+            } else {
+                let mut gain = OnePole::new(0.0); // fade in from silence
+                let mut pan = OnePole::new(tap.pan);
+                gain.set_time(self.smoothing_ms, self.sample_rate);
+                pan.set_time(self.smoothing_ms, self.sample_rate);
+                gain.set_target(tap.gain);
+                self.taps.push(TapState {
+                    delay_samples: tap.delay_samples,
+                    gain,
+                    pan,
+                });
+            }
+        }
+        // Shrink.
+        self.taps.truncate(taps.len());
+    }
+
+    /// Process one stereo frame, returning the mixed `(left, right)` output.
+    #[inline]
+    pub fn process_sample(&mut self, in_l: f32, in_r: f32) -> (f32, f32) {
+        self.left.write(in_l);
+        self.right.write(in_r);
+
+        let mut wet_l = 0.0;
+        let mut wet_r = 0.0;
+        for tap in &mut self.taps {
+            let gain = tap.gain.next();
+            let pan = tap.pan.next();
+            // Collapse the tap's stereo read to mono, then position it. This
+            // makes pan a true position (needed for crisp ping-pong) rather
+            // than a balance that merely attenuates one side.
+            let src = 0.5 * (self.left.read(tap.delay_samples) + self.right.read(tap.delay_samples));
+            let (lg, rg) = equal_power(pan);
+            wet_l += src * gain * lg;
+            wet_r += src * gain * rg;
+        }
+
+        let mix = self.mix.next();
+        let trim = self.output_trim.next();
+        let out_l = (in_l * (1.0 - mix) + wet_l * mix) * trim;
+        let out_r = (in_r * (1.0 - mix) + wet_r * mix) * trim;
+        (out_l, out_r)
+    }
+
+    /// Convenience: process two equal-length channel slices in place.
+    pub fn process(&mut self, left: &mut [f32], right: &mut [f32]) {
+        debug_assert_eq!(left.len(), right.len());
+        for (l, r) in left.iter_mut().zip(right.iter_mut()) {
+            let (out_l, out_r) = self.process_sample(*l, *r);
+            *l = out_l;
+            *r = out_r;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SR: f32 = 48_000.0;
+
+    /// Build an engine with already-settled coefficients so single-sample
+    /// assertions aren't fighting the smoother ramp.
+    fn settled_engine(taps: &[Tap], mix: f32) -> Engine {
+        let mut eng = Engine::new(SR, 4_096);
+        eng.set_smoothing_ms(0.0); // instant
+        eng.set_mix(mix);
+        eng.set_output_trim(1.0);
+        eng.set_taps(taps);
+        eng
+    }
+
+    #[test]
+    fn single_centered_tap_reproduces_delayed_impulse() {
+        // One tap at 10 samples, gain 0.5, centered.
+        let mut eng = settled_engine(&[Tap::new(10.0, 0.5, 0.0)], 1.0);
+        // Impulse in.
+        let (l, r) = eng.process_sample(1.0, 1.0);
+        // Wet-only, mono source = 1.0, gain 0.5, center ≈ 0.707 each side.
+        // At t=0 the tap (delay 10) hasn't fired yet -> silence.
+        assert!(l.abs() < 1e-6 && r.abs() < 1e-6);
+
+        let mut out = (0.0, 0.0);
+        for _ in 0..10 {
+            out = eng.process_sample(0.0, 0.0);
+        }
+        // After 10 more samples the impulse reaches the tap.
+        let (lg, rg) = equal_power(0.0);
+        assert!((out.0 - 0.5 * lg).abs() < 1e-5, "L {}", out.0);
+        assert!((out.1 - 0.5 * rg).abs() < 1e-5, "R {}", out.1);
+    }
+
+    #[test]
+    fn taps_sum() {
+        // Two taps at the same time add their gains.
+        let mut eng = settled_engine(&[Tap::new(5.0, 0.3, 0.0), Tap::new(5.0, 0.4, 0.0)], 1.0);
+        let mut out = (0.0, 0.0);
+        eng.process_sample(1.0, 1.0);
+        for _ in 0..5 {
+            out = eng.process_sample(0.0, 0.0);
+        }
+        let (lg, _) = equal_power(0.0);
+        assert!((out.0 - 0.7 * lg).abs() < 1e-5, "got {}", out.0);
+    }
+
+    #[test]
+    fn hard_pan_silences_other_side() {
+        let mut eng = settled_engine(&[Tap::new(3.0, 1.0, -1.0)], 1.0);
+        let mut out = (0.0, 0.0);
+        eng.process_sample(1.0, 1.0);
+        for _ in 0..3 {
+            out = eng.process_sample(0.0, 0.0);
+        }
+        assert!((out.0 - 1.0).abs() < 1e-5, "L {}", out.0);
+        assert!(out.1.abs() < 1e-6, "R {}", out.1);
+    }
+
+    #[test]
+    fn mix_zero_is_dry() {
+        let mut eng = settled_engine(&[Tap::new(2.0, 1.0, 0.0)], 0.0);
+        let (l, r) = eng.process_sample(0.42, 0.42);
+        assert!((l - 0.42).abs() < 1e-6 && (r - 0.42).abs() < 1e-6);
+    }
+
+    #[test]
+    fn output_trim_scales() {
+        let mut eng = settled_engine(&[], 0.0);
+        eng.set_output_trim(0.5);
+        eng.set_smoothing_ms(0.0);
+        eng.set_output_trim(0.5);
+        let (l, _) = eng.process_sample(1.0, 1.0);
+        assert!((l - 0.5).abs() < 1e-6, "got {l}");
+    }
+
+    #[test]
+    fn appended_tap_fades_in_without_click() {
+        let mut eng = Engine::new(SR, 4_096);
+        eng.set_smoothing_ms(20.0);
+        eng.set_mix(1.0);
+        eng.set_taps(&[Tap::new(1.0, 1.0, 0.0)]);
+        // Newly appended tap starts at gain 0 -> first output is ~silent.
+        eng.process_sample(1.0, 1.0);
+        let (l, _) = eng.process_sample(0.0, 0.0);
+        assert!(l.abs() < 0.2, "should fade in, got {l}");
+    }
+}
