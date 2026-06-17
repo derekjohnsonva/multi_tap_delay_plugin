@@ -13,15 +13,25 @@
 //! Preset curve shapes arrive in PR 8 and the ping-pong generator in PR 9 (both
 //! extend [`LaneSource`]); the tap-count change rule arrives in PR 10.
 
+use crate::curves;
+
 /// What feeds a lane's *linked* taps. Continuous shapes are sampled at a
 /// normalized x = `index / (count - 1)`; index-based generators (ping-pong)
-/// use the index directly. More variants are added in PR 8/9.
+/// use the index directly. The ping-pong generator is added in PR 9.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum LaneSource {
     /// Every tap gets the same value.
     Constant(f32),
     /// Linear ramp from `start` (first tap) to `end` (last tap).
     Ramp { start: f32, end: f32 },
+    /// Sine shape (`cycles` periods across the lane, `phase` in turns).
+    Sine { cycles: f32, phase: f32 },
+    /// Rising sawtooth (`cycles` periods across the lane).
+    Saw { cycles: f32 },
+    /// Triangle (`cycles` periods across the lane).
+    Triangle { cycles: f32 },
+    /// Exponential decay `exp(-k·x)` — the classic delay falloff.
+    ExpDecay { k: f32 },
 }
 
 impl LaneSource {
@@ -38,12 +48,14 @@ impl LaneSource {
 
     /// Raw (unclamped) value this source assigns to tap `index` of `count`.
     pub fn value(&self, index: usize, count: usize) -> f32 {
+        let x = Self::x_of(index, count);
         match *self {
             LaneSource::Constant(v) => v,
-            LaneSource::Ramp { start, end } => {
-                let x = Self::x_of(index, count);
-                start + (end - start) * x
-            }
+            LaneSource::Ramp { start, end } => start + (end - start) * x,
+            LaneSource::Sine { cycles, phase } => curves::sine(x, cycles, phase),
+            LaneSource::Saw { cycles } => curves::saw(x, cycles),
+            LaneSource::Triangle { cycles } => curves::triangle(x, cycles),
+            LaneSource::ExpDecay { k } => curves::exp_decay(x, k),
         }
     }
 }
@@ -206,6 +218,28 @@ mod tests {
         approx(lane.value(0), -1.0);
         approx(lane.value(1), 0.0);
         approx(lane.value(2), 1.0);
+    }
+
+    #[test]
+    fn selecting_a_preset_resamples_linked_keeps_detached() {
+        // Exponential decay over 5 taps; detach the middle one.
+        let mut lane = Lane::new(LaneSource::ExpDecay { k: 2.0 }, (0.0, 1.0), 5);
+        approx(lane.value(0), 1.0); // exp(-0) == 1
+        lane.set_tap_value(2, 0.42);
+        // Switch to a different preset: linked taps re-sample, detached holds.
+        lane.set_source(LaneSource::Constant(0.7));
+        approx(lane.value(0), 0.7);
+        approx(lane.value(4), 0.7);
+        approx(lane.value(2), 0.42);
+    }
+
+    #[test]
+    fn shape_sources_sample_at_tap_positions() {
+        // Triangle over 5 taps -> x = 0, .25, .5, .75, 1; peak at the middle.
+        let lane = Lane::new(LaneSource::Triangle { cycles: 1.0 }, (0.0, 1.0), 5);
+        approx(lane.value(0), 0.0);
+        approx(lane.value(2), 1.0);
+        approx(lane.value(4), 0.0);
     }
 
     #[test]

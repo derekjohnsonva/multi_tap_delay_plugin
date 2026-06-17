@@ -6,6 +6,7 @@
 //! and parameter glue (Phase 3) build on top of it.
 
 pub mod buffer;
+pub mod curves;
 pub mod engine;
 pub mod lane;
 pub mod pan;
