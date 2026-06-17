@@ -7,10 +7,12 @@
 
 pub mod buffer;
 pub mod engine;
+pub mod lane;
 pub mod pan;
 pub mod smoothing;
 
 pub use buffer::DelayLine;
 pub use engine::{Engine, Tap};
+pub use lane::{Lane, LaneSource};
 pub use pan::equal_power;
 pub use smoothing::OnePole;
