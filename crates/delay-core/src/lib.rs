@@ -6,6 +6,8 @@
 
 pub mod buffer;
 pub mod pan;
+pub mod smoothing;
 
 pub use buffer::DelayLine;
 pub use pan::equal_power;
+pub use smoothing::OnePole;
