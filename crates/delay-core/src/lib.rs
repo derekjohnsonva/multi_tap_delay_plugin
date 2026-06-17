@@ -5,5 +5,7 @@
 //! (design doc §6). Phase 1 fills in the engine module by module.
 
 pub mod buffer;
+pub mod pan;
 
 pub use buffer::DelayLine;
+pub use pan::equal_power;
