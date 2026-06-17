@@ -5,17 +5,15 @@
 //! yet — those arrive in later phases (DSP engine wiring in Phase 3, egui editor
 //! in Phase 4). It exists to prove the build/bundle/load pipeline end-to-end.
 
+mod params;
+
 use nih_plug::prelude::*;
+use params::DelayParams;
 use std::sync::Arc;
 
 struct DelayPlugin {
     params: Arc<DelayParams>,
 }
-
-/// No exposed parameters yet — the real parameter set lands in Phase 3 (PR 11).
-/// An empty `Params` struct is enough for the wrapper to load.
-#[derive(Params, Default)]
-struct DelayParams {}
 
 impl Default for DelayPlugin {
     fn default() -> Self {

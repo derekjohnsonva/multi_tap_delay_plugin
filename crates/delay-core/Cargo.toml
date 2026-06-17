@@ -9,3 +9,8 @@ description = "DSP core for the multi-tap delay (no plugin/host dependencies)."
 crate-type = ["lib"]
 
 [dependencies]
+# Pure-Rust, WASM-friendly: lets the plugin persist lane state via #[persist].
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"

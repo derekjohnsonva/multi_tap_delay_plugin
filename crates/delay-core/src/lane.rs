@@ -14,11 +14,12 @@
 //! extend [`LaneSource`]); the tap-count change rule arrives in PR 10.
 
 use crate::curves;
+use serde::{Deserialize, Serialize};
 
 /// What feeds a lane's *linked* taps. Continuous shapes are sampled at a
 /// normalized x = `index / (count - 1)`; index-based generators (ping-pong)
 /// use the index directly. The ping-pong generator is added in PR 9.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub enum LaneSource {
     /// Every tap gets the same value.
     Constant(f32),
@@ -72,7 +73,7 @@ impl LaneSource {
 }
 
 /// Per-tap link state.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 enum LinkState {
     /// Follows the source live.
     Linked,
@@ -86,7 +87,7 @@ enum LinkState {
 /// discarded — `taps` is a high-water-mark store and `active` marks how many
 /// of them are currently live. Shrinking just lowers `active`; re-growing
 /// revives the retained taps with their stored edits intact.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Lane {
     source: LaneSource,
     /// Resolved values are clamped to this inclusive range.
@@ -127,6 +128,13 @@ impl Lane {
     /// The current source.
     pub fn source(&self) -> LaneSource {
         self.source
+    }
+
+    /// Set the inclusive clamp range for resolved values. Used to switch the
+    /// amplitude lane between unipolar `0..1` and bipolar `-1..1` (polarity).
+    pub fn set_range(&mut self, min: f32, max: f32) {
+        self.min = min;
+        self.max = max;
     }
 
     /// Replace the source. Linked taps immediately follow the new source;
@@ -308,6 +316,28 @@ mod tests {
         // Magnitude would exceed 1 but clamps; sign still alternates.
         approx(lane.value(0), -1.0);
         approx(lane.value(1), 1.0);
+    }
+
+    #[test]
+    fn serde_round_trip_preserves_edits() {
+        let mut lane = Lane::new(LaneSource::ExpDecay { k: 2.0 }, (0.0, 1.0), 6);
+        lane.set_tap_value(3, 0.123); // a detached edit
+        lane.set_count(2); // shrink (retains the edit beyond active)
+        let json = serde_json::to_string(&lane).unwrap();
+        let restored: Lane = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.count(), 2);
+        // Re-growing the restored lane brings the persisted edit back.
+        let mut restored = restored;
+        restored.set_count(6);
+        approx(restored.value(3), 0.123);
+    }
+
+    #[test]
+    fn set_range_switches_polarity() {
+        let mut lane = Lane::new(LaneSource::Constant(-0.5), (0.0, 1.0), 2);
+        approx(lane.value(0), 0.0); // clamped unipolar
+        lane.set_range(-1.0, 1.0);
+        approx(lane.value(0), -0.5); // now bipolar
     }
 
     #[test]
