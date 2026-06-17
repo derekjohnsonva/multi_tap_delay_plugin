@@ -32,6 +32,11 @@ pub enum LaneSource {
     Triangle { cycles: f32 },
     /// Exponential decay `exp(-k·x)` — the classic delay falloff.
     ExpDecay { k: f32 },
+    /// Ping-pong pan generator (design §3): alternating sign per tap (left,
+    /// right, left, …) at magnitude `width`. `widen >= 0` grows the magnitude
+    /// across taps so the bounces spread wider over time. `width` is the
+    /// "auto ping-pong amount" scalar. Index-based, not a continuous curve.
+    PingPong { width: f32, widen: f32 },
 }
 
 impl LaneSource {
@@ -56,6 +61,12 @@ impl LaneSource {
             LaneSource::Saw { cycles } => curves::saw(x, cycles),
             LaneSource::Triangle { cycles } => curves::triangle(x, cycles),
             LaneSource::ExpDecay { k } => curves::exp_decay(x, k),
+            LaneSource::PingPong { width, widen } => {
+                let mag = (width * (1.0 + widen * x)).clamp(0.0, 1.0);
+                // Even taps go left (negative), odd taps go right (positive).
+                let sign = if index % 2 == 0 { -1.0 } else { 1.0 };
+                sign * mag
+            }
         }
     }
 }
@@ -240,6 +251,45 @@ mod tests {
         approx(lane.value(0), 0.0);
         approx(lane.value(2), 1.0);
         approx(lane.value(4), 0.0);
+    }
+
+    #[test]
+    fn ping_pong_alternates_sign() {
+        // Pan lane: alternating left/right at constant width, no widening.
+        let lane = Lane::new(
+            LaneSource::PingPong { width: 0.8, widen: 0.0 },
+            (-1.0, 1.0),
+            4,
+        );
+        approx(lane.value(0), -0.8); // left
+        approx(lane.value(1), 0.8); // right
+        approx(lane.value(2), -0.8);
+        approx(lane.value(3), 0.8);
+    }
+
+    #[test]
+    fn ping_pong_widens_across_taps() {
+        // width 0.5, widen 1.0: magnitude doubles from first tap to last.
+        let lane = Lane::new(
+            LaneSource::PingPong { width: 0.5, widen: 1.0 },
+            (-1.0, 1.0),
+            5,
+        );
+        approx(lane.value(0).abs(), 0.5); // x=0   -> 0.5
+        approx(lane.value(4).abs(), 1.0); // x=1   -> 0.5*2, clamped fine
+        assert!(lane.value(2).abs() > lane.value(0).abs());
+    }
+
+    #[test]
+    fn ping_pong_magnitude_clamps_to_range() {
+        let lane = Lane::new(
+            LaneSource::PingPong { width: 1.0, widen: 2.0 },
+            (-1.0, 1.0),
+            3,
+        );
+        // Magnitude would exceed 1 but clamps; sign still alternates.
+        approx(lane.value(0), -1.0);
+        approx(lane.value(1), 1.0);
     }
 
     #[test]
