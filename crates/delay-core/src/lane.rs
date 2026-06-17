@@ -64,7 +64,7 @@ impl LaneSource {
             LaneSource::PingPong { width, widen } => {
                 let mag = (width * (1.0 + widen * x)).clamp(0.0, 1.0);
                 // Even taps go left (negative), odd taps go right (positive).
-                let sign = if index % 2 == 0 { -1.0 } else { 1.0 };
+                let sign = if index.is_multiple_of(2) { -1.0 } else { 1.0 };
                 sign * mag
             }
         }
@@ -81,6 +81,11 @@ enum LinkState {
 }
 
 /// A parameter lane: a source plus `N` taps that sample it.
+///
+/// To implement the tap-count change rule (design §3), removed taps are not
+/// discarded — `taps` is a high-water-mark store and `active` marks how many
+/// of them are currently live. Shrinking just lowers `active`; re-growing
+/// revives the retained taps with their stored edits intact.
 #[derive(Clone, Debug)]
 pub struct Lane {
     source: LaneSource,
@@ -88,6 +93,7 @@ pub struct Lane {
     min: f32,
     max: f32,
     taps: Vec<LinkState>,
+    active: usize,
 }
 
 impl Lane {
@@ -98,12 +104,24 @@ impl Lane {
             min: range.0,
             max: range.1,
             taps: vec![LinkState::Linked; count],
+            active: count,
         }
     }
 
-    /// Number of taps.
+    /// Number of currently active taps.
     pub fn count(&self) -> usize {
-        self.taps.len()
+        self.active
+    }
+
+    /// Apply the tap-count change rule (design §3). Growing appends brand-new
+    /// linked taps beyond the high-water mark, or revives previously-removed
+    /// taps with their stored edits. Shrinking removes from the end but retains
+    /// removed taps so re-growing restores prior edits.
+    pub fn set_count(&mut self, count: usize) {
+        if count > self.taps.len() {
+            self.taps.resize(count, LinkState::Linked);
+        }
+        self.active = count;
     }
 
     /// The current source.
@@ -120,7 +138,7 @@ impl Lane {
 
     /// Whether tap `index` is linked to the source.
     pub fn is_linked(&self, index: usize) -> bool {
-        matches!(self.taps.get(index), Some(LinkState::Linked))
+        index < self.active && matches!(self.taps.get(index), Some(LinkState::Linked))
     }
 
     /// Resolved value of tap `index`, clamped to the lane range. Out-of-range
@@ -152,16 +170,16 @@ impl Lane {
 
     /// Relink tap `index` so it follows the source again. No-op if out of range.
     pub fn relink(&mut self, index: usize) {
-        if let Some(slot) = self.taps.get_mut(index) {
-            *slot = LinkState::Linked;
+        if index < self.active {
+            self.taps[index] = LinkState::Linked;
         }
     }
 
     /// Set tap `index` to an explicit value, detaching it if needed. This is
     /// what dragging a tap in the editor calls. No-op if out of range.
     pub fn set_tap_value(&mut self, index: usize, value: f32) {
-        if let Some(slot) = self.taps.get_mut(index) {
-            *slot = LinkState::Detached(value);
+        if index < self.active {
+            self.taps[index] = LinkState::Detached(value);
         }
     }
 }
@@ -290,6 +308,38 @@ mod tests {
         // Magnitude would exceed 1 but clamps; sign still alternates.
         approx(lane.value(0), -1.0);
         approx(lane.value(1), 1.0);
+    }
+
+    #[test]
+    fn growing_appends_linked_taps() {
+        let mut lane = Lane::new(LaneSource::Constant(0.5), (0.0, 1.0), 2);
+        lane.set_count(4);
+        assert_eq!(lane.count(), 4);
+        assert!(lane.is_linked(2) && lane.is_linked(3));
+        approx(lane.value(3), 0.5);
+    }
+
+    #[test]
+    fn shrinking_then_regrowing_restores_edits() {
+        let mut lane = Lane::new(LaneSource::Ramp { start: 0.0, end: 1.0 }, (0.0, 1.0), 5);
+        lane.set_tap_value(4, 0.9); // detach + edit the last tap
+        lane.set_count(2); // drop taps 2,3,4
+        assert_eq!(lane.count(), 2);
+        assert_eq!(lane.values().len(), 2);
+        lane.set_count(5); // bring them back
+        approx(lane.value(4), 0.9); // edit survived
+        assert!(!lane.is_linked(4));
+    }
+
+    #[test]
+    fn growing_past_high_water_appends_fresh_linked() {
+        let mut lane = Lane::new(LaneSource::Constant(0.3), (0.0, 1.0), 3);
+        lane.set_tap_value(1, 0.8);
+        lane.set_count(1); // retain 1,2
+        lane.set_count(6); // revive 1,2 + append 3,4,5
+        approx(lane.value(1), 0.8); // revived edit
+        assert!(lane.is_linked(5)); // freshly appended
+        approx(lane.value(5), 0.3);
     }
 
     #[test]

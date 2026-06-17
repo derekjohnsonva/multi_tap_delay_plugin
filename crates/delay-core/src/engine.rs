@@ -41,6 +41,9 @@ struct TapState {
     delay_samples: f32,
     gain: OnePole,
     pan: OnePole,
+    /// A removed tap that is fading its gain to zero before being dropped, so
+    /// the tap-count decrease doesn't click (design §3).
+    dying: bool,
 }
 
 /// The multi-tap delay engine. Allocate once with [`Engine::new`]; all
@@ -105,19 +108,30 @@ impl Engine {
         self.output_trim.set_target(gain.max(0.0));
     }
 
-    /// Number of active taps.
+    /// Number of tap slots the engine is processing, including any that are
+    /// fading out after removal.
     pub fn num_taps(&self) -> usize {
         self.taps.len()
     }
 
     /// Replace the tap set. Existing taps (by index) keep their smoother state
-    /// so gain/pan ramp from where they were; appended taps fade in from gain
-    /// 0 to avoid a click. Removal is currently abrupt — graceful crossfade-out
-    /// on tap-count decrease is handled by the lane model (PR 10, Phase 2).
+    /// so gain/pan ramp from where they were; appended taps fade in from gain 0;
+    /// removed taps (indices past the new length) fade their gain to 0 before
+    /// being dropped, so neither a count increase nor decrease clicks (§3).
     pub fn set_taps(&mut self, taps: &[Tap]) {
-        // Update or grow.
+        // Garbage-collect trailing taps that have finished fading out.
+        while let Some(last) = self.taps.last() {
+            if last.dying && last.gain.value().abs() < 1e-4 {
+                self.taps.pop();
+            } else {
+                break;
+            }
+        }
+
+        // Update existing slots or append new fade-in taps.
         for (i, tap) in taps.iter().enumerate() {
             if let Some(state) = self.taps.get_mut(i) {
+                state.dying = false;
                 state.delay_samples = tap.delay_samples;
                 state.gain.set_target(tap.gain);
                 state.pan.set_target(tap.pan);
@@ -131,11 +145,16 @@ impl Engine {
                     delay_samples: tap.delay_samples,
                     gain,
                     pan,
+                    dying: false,
                 });
             }
         }
-        // Shrink.
-        self.taps.truncate(taps.len());
+
+        // Any remaining slots are removed taps: fade them out, drop later.
+        for state in self.taps.iter_mut().skip(taps.len()) {
+            state.dying = true;
+            state.gain.set_target(0.0);
+        }
     }
 
     /// Process one stereo frame, returning the mixed `(left, right)` output.
@@ -253,6 +272,41 @@ mod tests {
         eng.set_output_trim(0.5);
         let (l, _) = eng.process_sample(1.0, 1.0);
         assert!((l - 0.5).abs() < 1e-6, "got {l}");
+    }
+
+    #[test]
+    fn removed_tap_fades_out_without_click() {
+        // Two short centered taps driven by DC; once settled, drop one tap and
+        // confirm the output never jumps between consecutive samples (a click).
+        let mut eng = Engine::new(SR, 4_096);
+        eng.set_smoothing_ms(20.0);
+        eng.set_mix(1.0);
+        eng.set_output_trim(1.0);
+        eng.set_taps(&[Tap::new(1.0, 1.0, 0.0), Tap::new(2.0, 1.0, 0.0)]);
+
+        // Settle: fade-in completes and the delay line fills with DC.
+        let mut prev = 0.0;
+        for _ in 0..6_000 {
+            prev = eng.process_sample(1.0, 1.0).0;
+        }
+
+        // Remove the second tap; the engine keeps it as a fading-out slot.
+        eng.set_taps(&[Tap::new(1.0, 1.0, 0.0)]);
+        assert_eq!(eng.num_taps(), 2, "removed tap is retained while fading");
+
+        let mut max_jump: f32 = 0.0;
+        // Run well past the ~20 ms fade so the gain reaches the GC threshold.
+        for _ in 0..12_000 {
+            let out = eng.process_sample(1.0, 1.0).0;
+            max_jump = max_jump.max((out - prev).abs());
+            prev = out;
+        }
+        // Abrupt removal would jump by ~0.7 in one sample; a fade keeps it tiny.
+        assert!(max_jump < 0.01, "click on removal: max per-sample jump {max_jump}");
+
+        // Once faded, a later update garbage-collects the dead slot.
+        eng.set_taps(&[Tap::new(1.0, 1.0, 0.0)]);
+        assert_eq!(eng.num_taps(), 1, "faded-out tap is dropped");
     }
 
     #[test]
