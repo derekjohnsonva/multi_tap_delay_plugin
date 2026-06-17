@@ -1,0 +1,11 @@
+[package]
+name = "delay-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "DSP core for the multi-tap delay (no plugin/host dependencies)."
+
+[lib]
+crate-type = ["lib"]
+
+[dependencies]

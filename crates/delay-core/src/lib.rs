@@ -1,0 +1,5 @@
+//! `delay-core` — the DSP heart of the multi-tap delay.
+//!
+//! This crate is plain Rust with **no plugin/host dependency** so it stays
+//! unit-testable without a DAW and can later compile to WASM for the web demo
+//! (design doc §6). Phase 1 fills in the engine; this is the empty scaffold.
