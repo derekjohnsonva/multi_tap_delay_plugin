@@ -258,6 +258,22 @@ mod tests {
     }
 
     #[test]
+    fn negative_gain_inverts_polarity() {
+        // Polarity (advanced): a negative tap gain flips the echo's sign, which
+        // is what turns comb peaks into notches (design §5).
+        let mut eng = settled_engine(&[Tap::new(4.0, -0.5, 0.0)], 1.0);
+        let mut out = (0.0, 0.0);
+        eng.process_sample(1.0, 1.0);
+        for _ in 0..4 {
+            out = eng.process_sample(0.0, 0.0);
+        }
+        let (lg, _) = equal_power(0.0);
+        // Same magnitude as +0.5 would give, but inverted.
+        assert!((out.0 - (-0.5 * lg)).abs() < 1e-5, "L {}", out.0);
+        assert!(out.0 < 0.0, "expected inverted output, got {}", out.0);
+    }
+
+    #[test]
     fn mix_zero_is_dry() {
         let mut eng = settled_engine(&[Tap::new(2.0, 1.0, 0.0)], 0.0);
         let (l, r) = eng.process_sample(0.42, 0.42);
