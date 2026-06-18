@@ -204,3 +204,38 @@ impl Default for DelayParams {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn note_divisions_map_to_beats() {
+        assert_eq!(NoteDivision::Quarter.beats(), 1.0);
+        assert_eq!(NoteDivision::Eighth.beats(), 0.5);
+        assert_eq!(NoteDivision::Sixteenth.beats(), 0.25);
+        assert_eq!(NoteDivision::DottedEighth.beats(), 0.75);
+        assert!((NoteDivision::EighthTriplet.beats() - 1.0 / 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn amp_shapes_map_to_sources() {
+        assert_eq!(AmpShape::Flat.to_source(0.5), LaneSource::Constant(1.0));
+        assert_eq!(AmpShape::ExpDecay.to_source(0.5), LaneSource::ExpDecay { k: 3.0 });
+        match AmpShape::Sine.to_source(0.0) {
+            LaneSource::Sine { cycles, phase } => {
+                assert!((cycles - 0.5).abs() < 1e-6);
+                assert_eq!(phase, 0.0);
+            }
+            other => panic!("expected Sine, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn default_params_and_lanes_agree_on_count() {
+        let params = DelayParams::default();
+        assert_eq!(params.tap_count.value(), DEFAULT_TAPS);
+        assert_eq!(params.amp_lane.read().count(), DEFAULT_TAPS as usize);
+        assert_eq!(params.pan_lane.read().count(), DEFAULT_TAPS as usize);
+    }
+}
