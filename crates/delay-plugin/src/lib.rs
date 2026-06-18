@@ -1,25 +1,99 @@
-//! PR 1 — Loadable stereo passthrough plugin.
+//! Multi-tap delay plugin (CLAP + VST3).
 //!
-//! This is the scaffolding milestone: a CLAP + VST3 plugin that loads in a host
-//! and passes stereo audio through unchanged. No delay, no parameters, no GUI
-//! yet — those arrive in later phases (DSP engine wiring in Phase 3, egui editor
-//! in Phase 4). It exists to prove the build/bundle/load pipeline end-to-end.
+//! PR 12 wires the parameters (PR 11) into the `delay-core` engine: each block
+//! we translate params into tap delay times (ms or tempo-synced divisions),
+//! sample the amplitude/pan lanes for per-tap gain/pan, and hand the taps to
+//! the engine, which smooths every coefficient. The GUI (Phase 4) edits the
+//! same lanes; here they're driven entirely from the params.
 
 mod params;
 
+use delay_core::{Engine, Tap};
 use nih_plug::prelude::*;
-use params::DelayParams;
+use params::{DelayParams, TimeMode, MAX_TAPS};
 use std::sync::Arc;
+
+/// Longest tap time the delay buffer can hold. Tap times past this clamp.
+const MAX_DELAY_SECONDS: f32 = 10.0;
+/// BPM used when the host reports no tempo (standalone / stopped transport).
+const FALLBACK_BPM: f32 = 120.0;
 
 struct DelayPlugin {
     params: Arc<DelayParams>,
+    engine: Engine,
+    sample_rate: f32,
+    /// Reused per-block tap buffer so `process()` never allocates.
+    scratch: Vec<Tap>,
 }
 
 impl Default for DelayPlugin {
     fn default() -> Self {
+        // The engine is rebuilt in `initialize()` once the real sample rate is
+        // known; this placeholder keeps `Default` total.
         Self {
             params: Arc::new(DelayParams::default()),
+            engine: Engine::new(44_100.0, 44_100),
+            sample_rate: 44_100.0,
+            scratch: Vec::with_capacity(MAX_TAPS as usize),
         }
+    }
+}
+
+impl DelayPlugin {
+    /// Tap spacing (samples between consecutive taps) for the current params.
+    fn step_samples(&self, bpm: f32) -> f32 {
+        match self.params.time_mode.value() {
+            TimeMode::Sync => {
+                let beats = self.params.sync_division.value().beats();
+                beats * (60.0 / bpm) * self.sample_rate
+            }
+            TimeMode::Free => self.params.free_ms.value() / 1000.0 * self.sample_rate,
+        }
+    }
+
+    /// Rebuild the engine's tap set from the params + current tempo. Reads the
+    /// persisted lanes non-blockingly; if the editor holds the lock this block
+    /// is skipped and the engine keeps smoothing toward its last targets.
+    fn update_taps(&mut self, bpm: f32) {
+        let count = self.params.tap_count.value() as usize;
+        let step = self.step_samples(bpm);
+        let amp_source = self
+            .params
+            .amp_shape
+            .value()
+            .to_source(self.params.amp_amount.value());
+        let pan_source = delay_core::LaneSource::PingPong {
+            width: self.params.pingpong_amount.value(),
+            widen: 0.0,
+        };
+        // Polarity (PR 13) widens the amplitude lane to bipolar.
+        let amp_range = if self.params.polarity.value() {
+            (-1.0, 1.0)
+        } else {
+            (0.0, 1.0)
+        };
+
+        let (Some(mut amp), Some(mut pan)) =
+            (self.params.amp_lane.try_write(), self.params.pan_lane.try_write())
+        else {
+            return;
+        };
+
+        amp.set_range(amp_range.0, amp_range.1);
+        amp.set_source(amp_source);
+        amp.set_count(count);
+        pan.set_source(pan_source);
+        pan.set_count(count);
+
+        self.scratch.clear();
+        for i in 0..count {
+            let delay = (i as f32 + 1.0) * step;
+            self.scratch.push(Tap::new(delay, amp.value(i), pan.value(i)));
+        }
+        drop(amp);
+        drop(pan);
+
+        self.engine.set_taps(&self.scratch);
     }
 }
 
@@ -48,13 +122,51 @@ impl Plugin for DelayPlugin {
         self.params.clone()
     }
 
+    fn initialize(
+        &mut self,
+        _audio_io_layout: &AudioIOLayout,
+        buffer_config: &BufferConfig,
+        _context: &mut impl InitContext<Self>,
+    ) -> bool {
+        self.sample_rate = buffer_config.sample_rate;
+        let max_delay = (self.sample_rate * MAX_DELAY_SECONDS).ceil() as usize;
+        self.engine = Engine::new(self.sample_rate, max_delay);
+        self.engine.set_smoothing_ms(self.params.smoothing.value());
+        self.scratch.reserve(MAX_TAPS as usize);
+        true
+    }
+
+    fn reset(&mut self) {
+        self.engine.reset();
+    }
+
     fn process(
         &mut self,
-        _buffer: &mut Buffer,
+        buffer: &mut Buffer,
         _aux: &mut AuxiliaryBuffers,
-        _context: &mut impl ProcessContext<Self>,
+        context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
-        // Passthrough: leave the buffer untouched.
+        // Per-block config: rebuild taps and push the scalar params.
+        let bpm = context.transport().tempo.unwrap_or(FALLBACK_BPM as f64) as f32;
+        self.update_taps(bpm);
+        self.engine.set_smoothing_ms(self.params.smoothing.value());
+        self.engine.set_mix(self.params.mix.value());
+        self.engine
+            .set_output_trim(util::db_to_gain(self.params.output_trim.value()));
+
+        // Stereo in-place processing. Our only IO layout is stereo, but guard
+        // the channel count so a mono host config can't panic.
+        let channels = buffer.as_slice();
+        if channels.len() >= 2 {
+            let (left, right) = channels.split_at_mut(1);
+            self.engine.process(left[0], right[0]);
+        } else if let [mono] = channels {
+            for sample in mono.iter_mut() {
+                let (l, _r) = self.engine.process_sample(*sample, *sample);
+                *sample = l;
+            }
+        }
+
         ProcessStatus::Normal
     }
 }

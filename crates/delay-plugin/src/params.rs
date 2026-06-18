@@ -50,7 +50,6 @@ pub enum NoteDivision {
 
 impl NoteDivision {
     /// Length of this division in quarter-note beats.
-    #[allow(dead_code)] // wired into process() in PR 12
     pub fn beats(self) -> f32 {
         match self {
             NoteDivision::Whole => 4.0,
@@ -83,7 +82,6 @@ pub enum AmpShape {
 
 impl AmpShape {
     /// Map the shape + a normalized `amount` knob to a concrete [`LaneSource`].
-    #[allow(dead_code)] // wired into process() in PR 12
     pub fn to_source(self, amount: f32) -> LaneSource {
         // Shapes that take a "cycles" parameter share this 0.5..4 mapping.
         let cycles = 0.5 + amount * 3.5;
