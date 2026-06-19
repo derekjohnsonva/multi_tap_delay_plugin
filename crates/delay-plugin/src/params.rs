@@ -8,7 +8,9 @@
 
 use delay_core::{Lane, LaneSource};
 use nih_plug::prelude::*;
+use nih_plug_egui::EguiState;
 use parking_lot::RwLock;
+use std::sync::Arc;
 
 /// Soft maximum tap count (design §7 — "soft max 128").
 pub const MAX_TAPS: i32 = 128;
@@ -98,8 +100,17 @@ impl AmpShape {
 /// Default tap count, shared by the params and the initial lanes so they agree.
 pub const DEFAULT_TAPS: i32 = 8;
 
+/// Default editor window size (logical points). Wide enough for the toolbar row
+/// now; the lanes + meter (PR 15–18) will grow into the area below.
+pub const EDITOR_WIDTH: u32 = 760;
+pub const EDITOR_HEIGHT: u32 = 480;
+
 #[derive(Params)]
 pub struct DelayParams {
+    /// Persisted editor window state (size), restored across save/reload.
+    #[persist = "editor-state"]
+    pub editor_state: Arc<EguiState>,
+
     #[id = "taps"]
     pub tap_count: IntParam,
 
@@ -148,6 +159,8 @@ impl Default for DelayParams {
     fn default() -> Self {
         let taps = DEFAULT_TAPS as usize;
         Self {
+            editor_state: EguiState::from_size(EDITOR_WIDTH, EDITOR_HEIGHT),
+
             tap_count: IntParam::new("Taps", DEFAULT_TAPS, IntRange::Linear { min: 1, max: MAX_TAPS }),
 
             time_mode: EnumParam::new("Time Mode", TimeMode::Sync),

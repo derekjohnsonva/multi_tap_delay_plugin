@@ -6,6 +6,7 @@
 //! the engine, which smooths every coefficient. The GUI (Phase 4) edits the
 //! same lanes; here they're driven entirely from the params.
 
+mod editor;
 mod params;
 
 use delay_core::{Engine, Tap};
@@ -120,6 +121,10 @@ impl Plugin for DelayPlugin {
 
     fn params(&self) -> Arc<dyn Params> {
         self.params.clone()
+    }
+
+    fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
+        editor::create(self.params.clone())
     }
 
     fn initialize(

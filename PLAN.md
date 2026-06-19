@@ -2,7 +2,7 @@
 
 _PR-sized breakdown of the work described in [design_document.md](./design_document.md). Each PR is independently reviewable, leaves the project in a building/loadable state, and is ordered so later PRs build on earlier ones._
 
-> **Progress:** Phases 0–3 (PR 1–13) are ✅ **done** — workspace scaffolded; `delay-core` engine + lane/curve model (45 tests); the plugin now exposes the full param set, persists lane state, and wires params → engine with tempo sync, so the CLAP + VST3 bundle is an audible multi-tap delay. 48 unit tests pass workspace-wide; clippy clean. Next up: Phase 4 (egui editor). **Not yet verified by a human:** loading the bundle in a DAW (Reaper/Bitwig) and listening; `clap-validator`/`pluginval` runs (the validator install was blocked as an untrusted external build — authorize it or run manually).
+> **Progress:** Phases 0–3 (PR 1–13) are ✅ **done** — workspace scaffolded; `delay-core` engine + lane/curve model (45 tests); the plugin now exposes the full param set, persists lane state, and wires params → engine with tempo sync, so the CLAP + VST3 bundle is an audible multi-tap delay. **Phase 4 in progress:** PR 14 ✅ — `nih_plug_egui` editor scaffold + toolbar (all global params bound via `ParamSlider`; persisted window size; placeholder area for the lanes/meter). 48 unit tests pass workspace-wide; clippy clean; release bundle builds with the GUI. Next up: PR 15 (amplitude lane rendering). **Not yet verified by a human:** loading the bundle in a DAW (Reaper/Bitwig) and listening + opening the editor; `clap-validator`/`pluginval` runs (the validator install was blocked as an untrusted external build — authorize it or run manually).
 
 ---
 
