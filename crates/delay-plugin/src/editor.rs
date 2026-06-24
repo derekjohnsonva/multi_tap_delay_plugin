@@ -71,13 +71,18 @@ pub fn create(
 
                 // Amplitude lane (top): unipolar 0..1, or bipolar when polarity
                 // is on. The continuous source shape is traced behind the taps.
+                // Drag a tap to detach + set it; drag the background to nudge the
+                // amp amount; right-click a tap to relink it.
                 ui.add_space(2.0);
                 ui.label(egui::RichText::new("Amplitude").small().weak());
                 let bipolar = params.polarity.value();
-                draw_lane(
+                lane_widget(
                     ui,
-                    &params.amp_lane.read(),
+                    &params.amp_lane,
+                    &params.amp_amount,
+                    setter,
                     LaneView {
+                        id: "amp",
                         height: lane_h,
                         bipolar,
                         overlay: Overlay::SourceCurve,
@@ -89,13 +94,16 @@ pub fn create(
 
                 // Pan lane (bottom): always bipolar, centre = 0, up = R / down =
                 // L. Ping-pong shows up as the alternating zig-zag connecting the
-                // tap tips.
+                // tap tips. Dragging the background nudges the ping-pong width.
                 ui.add_space(6.0);
                 ui.label(egui::RichText::new("Pan").small().weak());
-                draw_lane(
+                lane_widget(
                     ui,
-                    &params.pan_lane.read(),
+                    &params.pan_lane,
+                    &params.pingpong_amount,
+                    setter,
                     LaneView {
+                        id: "pan",
                         height: lane_h,
                         bipolar: true,
                         overlay: Overlay::ConnectTaps,
@@ -175,6 +183,8 @@ enum Overlay {
 
 /// Presentation options for a lane, so the one renderer serves both lanes.
 struct LaneView {
+    /// Stable id for per-lane interaction state (e.g. `"amp"`, `"pan"`).
+    id: &'static str,
     /// Height of the lane's drawing area in points.
     height: f32,
     /// Baseline in the middle (`-1..1`) rather than at the bottom (`0..1`).
@@ -188,23 +198,106 @@ struct LaneView {
     comb_frac: f32,
 }
 
-/// Draw one parameter lane (design §7): a guide line traced behind each tap,
-/// every tap drawn as a stem rising from the baseline to a lollipop at its
-/// resolved value. Linked taps follow the source and render in the accent
-/// colour; detached taps (per-tap overrides) render as a distinct hollow marker
-/// so manual edits stand out. Read-only here — PR 19 makes taps/curve draggable.
-fn draw_lane(ui: &mut egui::Ui, lane: &Lane, view: LaneView) {
-    let LaneView {
-        height,
-        bipolar,
-        overlay,
-        top_label,
-        bottom_label,
-        comb_frac,
-    } = view;
+/// Pointer must be within this many points of a tap (in x) to grab it rather
+/// than the curve behind it.
+const TAP_GRAB_PX: f32 = 12.0;
 
-    let (rect, _response) =
-        ui.allocate_exact_size(egui::vec2(ui.available_width(), height), egui::Sense::hover());
+/// Geometry shared by painting and hit-testing a lane, so both map taps to the
+/// same screen positions.
+struct LaneGeom {
+    plot: egui::Rect,
+    baseline_y: f32,
+    half: f32,
+    lo: f32,
+    count: usize,
+}
+
+impl LaneGeom {
+    fn new(rect: egui::Rect, bipolar: bool, count: usize) -> Self {
+        let plot = rect.shrink(PLOT_PAD);
+        // Value 1.0 reaches the top; the baseline sits at the bottom (unipolar)
+        // or the vertical centre (bipolar). Full-scale magnitude is always 1.0.
+        let baseline_y = if bipolar { plot.center().y } else { plot.bottom() };
+        let half = if bipolar { plot.height() * 0.5 } else { plot.height() };
+        let lo = if bipolar { -1.0 } else { 0.0 };
+        Self {
+            plot,
+            baseline_y,
+            half,
+            lo,
+            count,
+        }
+    }
+
+    /// Screen x of tap `i`. A single tap sits at the left edge.
+    fn x_of(&self, i: usize) -> f32 {
+        let t = if self.count <= 1 {
+            0.0
+        } else {
+            i as f32 / (self.count - 1) as f32
+        };
+        self.plot.left() + t * self.plot.width()
+    }
+
+    /// Screen y of value `v`.
+    fn y_of(&self, v: f32) -> f32 {
+        self.baseline_y - v * self.half
+    }
+
+    /// Value (clamped to the lane range) for a screen y.
+    fn value_at_y(&self, y: f32) -> f32 {
+        ((self.baseline_y - y) / self.half).clamp(self.lo, 1.0)
+    }
+
+    /// Tap index closest in x to `px`, paired with that x distance in points.
+    fn nearest_tap(&self, px: f32) -> Option<(usize, f32)> {
+        if self.count == 0 {
+            return None;
+        }
+        let i = (0..self.count)
+            .min_by(|&a, &b| {
+                (self.x_of(a) - px)
+                    .abs()
+                    .total_cmp(&(self.x_of(b) - px).abs())
+            })
+            .unwrap();
+        Some((i, (self.x_of(i) - px).abs()))
+    }
+}
+
+/// Render and handle interaction for one parameter lane (design §7). Painting
+/// reads a snapshot under the read lock; edits take the write lock briefly. The
+/// audio thread only `try_write`s, so it never stalls on these GUI edits.
+///
+/// Interaction (design §7): **drag a tap** to detach + set its value; **drag the
+/// background curve** to nudge the source `amount` param, which moves every
+/// linked tap at once; **right-click a tap** to relink it to the source.
+fn lane_widget(
+    ui: &mut egui::Ui,
+    lock: &parking_lot::RwLock<Lane>,
+    amount: &FloatParam,
+    setter: &ParamSetter,
+    view: LaneView,
+) {
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), view.height),
+        egui::Sense::click_and_drag(),
+    );
+
+    // Paint from a read snapshot, then drop the guard before any write.
+    let count = {
+        let lane = lock.read();
+        let geom = LaneGeom::new(rect, view.bipolar, lane.count());
+        paint_lane(ui, rect, &lane, &geom, &view);
+        lane.count()
+    };
+
+    handle_lane_input(ui, &response, rect, &view, count, lock, amount, setter);
+}
+
+/// Draw a lane's frame, comb shade, baseline, labels, source/zig-zag overlay,
+/// and the per-tap stems + lollipops (linked filled, detached hollow).
+fn paint_lane(ui: &egui::Ui, rect: egui::Rect, lane: &Lane, geom: &LaneGeom, view: &LaneView) {
     let painter = ui.painter_at(rect);
     let visuals = ui.visuals();
 
@@ -217,33 +310,16 @@ fn draw_lane(ui: &mut egui::Ui, lane: &Lane, view: LaneView) {
         egui::StrokeKind::Inside,
     );
 
-    let plot = rect.shrink(PLOT_PAD);
-
     // Comb-zone hint: shade the short-time region behind everything else.
-    shade_comb_zone(&painter, plot, comb_frac);
-    // Value 1.0 reaches the top; the baseline sits at the bottom (unipolar) or
-    // the vertical centre (bipolar). Full-scale magnitude is always 1.0.
-    let baseline_y = if bipolar { plot.center().y } else { plot.bottom() };
-    let half = if bipolar { plot.height() * 0.5 } else { plot.height() };
-    let value_to_y = |v: f32| baseline_y - v * half;
-    let lo = if bipolar { -1.0 } else { 0.0 };
+    shade_comb_zone(&painter, geom.plot, view.comb_frac);
 
-    let count = lane.count();
-    // Single tap sits at the left edge of the curve; otherwise spread across.
-    let index_to_x = |i: usize| {
-        let t = if count <= 1 {
-            0.0
-        } else {
-            i as f32 / (count - 1) as f32
-        };
-        plot.left() + t * plot.width()
-    };
+    let count = geom.count;
 
     // Baseline.
     painter.line_segment(
         [
-            egui::pos2(plot.left(), baseline_y),
-            egui::pos2(plot.right(), baseline_y),
+            egui::pos2(geom.plot.left(), geom.baseline_y),
+            egui::pos2(geom.plot.right(), geom.baseline_y),
         ],
         egui::Stroke::new(1.0, visuals.weak_text_color()),
     );
@@ -251,16 +327,16 @@ fn draw_lane(ui: &mut egui::Ui, lane: &Lane, view: LaneView) {
     // Edge labels (top + bottom-left of the plot).
     let label_color = visuals.weak_text_color();
     painter.text(
-        plot.left_top(),
+        geom.plot.left_top(),
         egui::Align2::LEFT_TOP,
-        top_label,
+        view.top_label,
         egui::FontId::proportional(10.0),
         label_color,
     );
     painter.text(
-        plot.left_bottom(),
+        geom.plot.left_bottom(),
         egui::Align2::LEFT_BOTTOM,
-        bottom_label,
+        view.bottom_label,
         egui::FontId::proportional(10.0),
         label_color,
     );
@@ -270,20 +346,20 @@ fn draw_lane(ui: &mut egui::Ui, lane: &Lane, view: LaneView) {
     let overlay_color = accent.gamma_multiply(0.4);
 
     // Guide line behind the taps.
-    let overlay_pts: Vec<egui::Pos2> = match overlay {
+    let overlay_pts: Vec<egui::Pos2> = match view.overlay {
         Overlay::SourceCurve => {
             const CURVE_STEPS: usize = 96;
             let source = lane.source();
             (0..=CURVE_STEPS)
                 .map(|s| {
                     let t = s as f32 / CURVE_STEPS as f32;
-                    let v = source.value_at(t).clamp(lo, 1.0);
-                    egui::pos2(plot.left() + t * plot.width(), value_to_y(v))
+                    let v = source.value_at(t).clamp(geom.lo, 1.0);
+                    egui::pos2(geom.plot.left() + t * geom.plot.width(), geom.y_of(v))
                 })
                 .collect()
         }
         Overlay::ConnectTaps => (0..count)
-            .map(|i| egui::pos2(index_to_x(i), value_to_y(lane.value(i))))
+            .map(|i| egui::pos2(geom.x_of(i), geom.y_of(lane.value(i))))
             .collect(),
     };
     painter.add(egui::Shape::line(
@@ -293,10 +369,8 @@ fn draw_lane(ui: &mut egui::Ui, lane: &Lane, view: LaneView) {
 
     // Stems + lollipops for each tap.
     for i in 0..count {
-        let v = lane.value(i);
-        let x = index_to_x(i);
-        let tip = egui::pos2(x, value_to_y(v));
-        let base = egui::pos2(x, baseline_y);
+        let tip = egui::pos2(geom.x_of(i), geom.y_of(lane.value(i)));
+        let base = egui::pos2(geom.x_of(i), geom.baseline_y);
         let linked = lane.is_linked(i);
         let color = if linked { accent } else { detached_color };
 
@@ -310,6 +384,94 @@ fn draw_lane(ui: &mut egui::Ui, lane: &Lane, view: LaneView) {
         }
     }
 }
+
+/// What a drag is currently moving, remembered for the gesture's duration so a
+/// drag started on a tap stays on that tap even as the pointer moves.
+#[derive(Clone, Copy)]
+enum DragTarget {
+    /// Detach + set this tap's value.
+    Tap(usize),
+    /// Nudge the source amount param (moves all linked taps).
+    Curve,
+}
+
+/// Apply pointer interaction to a lane: tap drag (detach + set), curve drag
+/// (adjust `amount`), and right-click relink. All lane edits go through the
+/// write lock; the amount nudge goes through the param setter's gesture path.
+#[allow(clippy::too_many_arguments)]
+fn handle_lane_input(
+    ui: &egui::Ui,
+    response: &egui::Response,
+    rect: egui::Rect,
+    view: &LaneView,
+    count: usize,
+    lock: &parking_lot::RwLock<Lane>,
+    amount: &FloatParam,
+    setter: &ParamSetter,
+) {
+    let geom = LaneGeom::new(rect, view.bipolar, count);
+    let drag_id = egui::Id::new(("lane_drag", view.id));
+
+    // Right-click a tap to relink it to the source.
+    if response.secondary_clicked() {
+        if let Some(px) = response.interact_pointer_pos() {
+            if let Some((i, dist)) = geom.nearest_tap(px.x) {
+                if dist <= TAP_GRAB_PX {
+                    lock.write().relink(i);
+                }
+            }
+        }
+    }
+
+    // Decide, once per gesture, whether the drag grabs a tap or the curve.
+    if response.drag_started() {
+        let target = response
+            .interact_pointer_pos()
+            .and_then(|px| geom.nearest_tap(px.x))
+            .filter(|&(_, dist)| dist <= TAP_GRAB_PX)
+            .map(|(i, _)| DragTarget::Tap(i))
+            .unwrap_or(DragTarget::Curve);
+        if matches!(target, DragTarget::Curve) {
+            setter.begin_set_parameter(amount);
+        }
+        ui.data_mut(|d| d.insert_temp(drag_id, TargetMarker(target)));
+    }
+
+    if response.dragged() {
+        let target = ui.data(|d| d.get_temp::<TargetMarker>(drag_id)).map(|m| m.0);
+        match target {
+            Some(DragTarget::Tap(i)) => {
+                if let Some(px) = response.interact_pointer_pos() {
+                    let v = geom.value_at_y(px.y);
+                    lock.write().set_tap_value(i, v);
+                }
+            }
+            Some(DragTarget::Curve) => {
+                // Vertical drag nudges the amount; up increases. The audio thread
+                // re-derives the source from this param, moving all linked taps.
+                let dy = response.drag_delta().y;
+                if dy != 0.0 {
+                    let next = (amount.value() - dy * 0.004).clamp(0.0, 1.0);
+                    setter.set_parameter(amount, next);
+                }
+            }
+            None => {}
+        }
+    }
+
+    if response.drag_stopped() {
+        let target = ui.data(|d| d.get_temp::<TargetMarker>(drag_id)).map(|m| m.0);
+        if matches!(target, Some(DragTarget::Curve)) {
+            setter.end_set_parameter(amount);
+        }
+        ui.data_mut(|d| d.remove::<TargetMarker>(drag_id));
+    }
+}
+
+/// Wrapper so [`DragTarget`] can live in egui's temp data store (which needs a
+/// `'static + Clone + Send + Sync` value).
+#[derive(Clone, Copy)]
+struct TargetMarker(DragTarget);
 
 /// Tap spacing in milliseconds for the current time-mode params. Mirrors the
 /// engine's `step_samples` (lib.rs) but in ms, so the editor can label the time
@@ -539,6 +701,51 @@ mod tests {
     fn degenerate_inputs_are_safe() {
         assert_eq!(comb_fraction(0.0, 8), 0.0);
         assert_eq!(comb_fraction(10.0, 0), 0.0);
+    }
+
+    fn rect_100() -> egui::Rect {
+        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(100.0, 100.0))
+    }
+
+    #[test]
+    fn unipolar_geom_maps_value_and_y() {
+        let g = LaneGeom::new(rect_100(), false, 5);
+        // Baseline at the bottom of the padded plot; full scale at the top.
+        approx(g.y_of(0.0), g.plot.bottom());
+        approx(g.y_of(1.0), g.plot.top());
+        // value_at_y is the inverse and clamps to 0..1.
+        approx(g.value_at_y(g.plot.bottom()), 0.0);
+        approx(g.value_at_y(g.plot.top()), 1.0);
+        assert_eq!(g.value_at_y(g.plot.bottom() + 50.0), 0.0); // below clamps
+    }
+
+    #[test]
+    fn bipolar_geom_centres_baseline_and_clamps() {
+        let g = LaneGeom::new(rect_100(), true, 4);
+        approx(g.baseline_y, g.plot.center().y);
+        approx(g.value_at_y(g.plot.center().y), 0.0);
+        approx(g.value_at_y(g.plot.top()), 1.0);
+        approx(g.value_at_y(g.plot.bottom()), -1.0);
+    }
+
+    #[test]
+    fn nearest_tap_picks_closest_index() {
+        let g = LaneGeom::new(rect_100(), false, 5);
+        // Pointer right on tap 0 and tap 4.
+        assert_eq!(g.nearest_tap(g.x_of(0)).unwrap().0, 0);
+        assert_eq!(g.nearest_tap(g.x_of(4)).unwrap().0, 4);
+        // Slightly off tap 2 still resolves to 2 with a small distance.
+        let (i, dist) = g.nearest_tap(g.x_of(2) + 1.0).unwrap();
+        assert_eq!(i, 2);
+        approx(dist, 1.0);
+        // No taps -> nothing to grab.
+        assert!(LaneGeom::new(rect_100(), false, 0).nearest_tap(10.0).is_none());
+    }
+
+    #[test]
+    fn single_tap_sits_at_left_edge() {
+        let g = LaneGeom::new(rect_100(), false, 1);
+        approx(g.x_of(0), g.plot.left());
     }
 
     #[test]
