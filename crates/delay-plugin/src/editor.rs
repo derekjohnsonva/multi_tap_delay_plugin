@@ -1,12 +1,14 @@
-//! PR 14–15 — egui editor: toolbar (PR 14) + amplitude lane rendering (PR 15).
+//! The egui editor (design §7): a toolbar of global controls over two stacked,
+//! directly-editable lanes (amplitude + pan) sharing one time axis, with an
+//! always-visible output meter at the right edge.
 //!
-//! The toolbar wires the global controls (design §7) to the same params the
-//! generic UI exposes. Below it, PR 15 adds the first custom-drawn lane: the
-//! **amplitude** lane (design §7) — stems/lollipops rising from a baseline with
-//! the source curve traced behind them, linked vs. detached taps drawn
-//! distinctly, and a bipolar layout when polarity is on. This view is read-only
-//! for now; direct lane interaction (dragging taps/curve) arrives in PR 19. The
-//! pan lane, shared time axis, and meter follow in PR 16–18.
+//! - Toolbar wires every global param through the `ParamSetter` gesture path
+//!   (enum params as dropdowns, bools as checkboxes, the rest as sliders).
+//! - Each lane draws the source shape behind per-tap stems/lollipops, with
+//!   linked vs. detached taps distinct; drag a tap to set it, drag the curve to
+//!   nudge the shape amount, double/right-click to relink, "Reset" to relink all.
+//! - The time axis labels switch ms ↔ note-division by mode and shades the
+//!   comb zone; the meter shows the post-trim peak with a clip zone.
 
 use crate::params::{DelayParams, NoteDivision, TimeMode};
 use delay_core::{Lane, COMB_ZONE_MS};
@@ -19,6 +21,43 @@ use std::sync::Arc;
 /// axis so their tap x-positions line up exactly.
 const PLOT_PAD: f32 = 8.0;
 
+// --- Palette (design §1: demo-quality look) -------------------------------
+/// Primary accent: curves, linked taps, selection.
+const ACCENT: egui::Color32 = egui::Color32::from_rgb(0x4d, 0xa6, 0xff);
+/// Detached / manually-edited taps.
+const DETACHED: egui::Color32 = egui::Color32::from_rgb(0xff, 0xae, 0x42);
+/// Window / panel background.
+const BG: egui::Color32 = egui::Color32::from_rgb(0x17, 0x1a, 0x1f);
+/// Recessed lane-track / meter background.
+const TRACK: egui::Color32 = egui::Color32::from_rgb(0x0e, 0x10, 0x14);
+/// Hairline borders around panels.
+const HAIRLINE: egui::Color32 = egui::Color32::from_rgb(0x2b, 0x31, 0x3a);
+
+/// Apply the plugin's dark theme once at editor creation (design §1 — a
+/// cohesive, demo-quality look rather than raw egui defaults).
+fn apply_theme(ctx: &egui::Context) {
+    let mut v = egui::Visuals::dark();
+    v.panel_fill = BG;
+    v.window_fill = BG;
+    v.extreme_bg_color = TRACK;
+    v.faint_bg_color = egui::Color32::from_rgb(0x1d, 0x21, 0x28);
+    v.selection.bg_fill = ACCENT.gamma_multiply(0.4);
+    v.selection.stroke = egui::Stroke::new(1.0, ACCENT);
+    v.hyperlink_color = ACCENT;
+    v.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, HAIRLINE);
+    // Accent the controls' fills so sliders/checkboxes read as one family.
+    v.widgets.inactive.bg_fill = egui::Color32::from_rgb(0x23, 0x29, 0x32);
+    v.widgets.inactive.weak_bg_fill = egui::Color32::from_rgb(0x23, 0x29, 0x32);
+    v.widgets.hovered.bg_fill = egui::Color32::from_rgb(0x2c, 0x34, 0x40);
+    v.widgets.active.bg_fill = ACCENT.gamma_multiply(0.6);
+    ctx.set_visuals(v);
+
+    let mut style = (*ctx.style()).clone();
+    style.spacing.item_spacing = egui::vec2(8.0, 6.0);
+    style.spacing.button_padding = egui::vec2(7.0, 3.0);
+    ctx.set_style(style);
+}
+
 /// Build the editor. Returns `None` only if the host can't host an egui window.
 pub fn create(
     params: Arc<DelayParams>,
@@ -29,12 +68,13 @@ pub fn create(
     create_egui_editor(
         egui_state,
         (),
-        |_, _| {},
+        |ctx, _| apply_theme(ctx),
         move |ctx, setter, _state| {
             egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
-                ui.add_space(4.0);
+                ui.add_space(3.0);
                 toolbar(ui, &params, setter);
-                ui.add_space(4.0);
+                // Keep the controls tucked just above the graphs.
+                ui.add_space(1.0);
             });
 
             // Output meter pinned to the right edge, always visible (design §7).
@@ -51,18 +91,10 @@ pub fn create(
                 // The meter and lanes are level-driven; keep repainting so they
                 // animate even when no params change.
                 ctx.request_repaint();
-                // Reconstruct each lane's derived source/range/count from the
-                // params before reading them. These fields aren't persisted, so
-                // the editor must rebuild them itself rather than rely on the
-                // audio thread having processed a block — otherwise a project
-                // opened with the transport stopped would render stale lanes.
-                // The audio thread only `try_write`s, so this brief blocking
-                // write never makes it wait on the GUI.
-                {
-                    let mut amp = params.amp_lane.write();
-                    let mut pan = params.pan_lane.write();
-                    params.apply_to_lanes(&mut amp, &mut pan);
-                }
+                // The audio thread keeps each lane's source/count/range in sync
+                // with the params every block, so reading them here yields the
+                // live per-tap gains/pans. A blocking read is fine: the audio
+                // thread only ever `try_write`s, so it never waits on the GUI.
 
                 // Tap spacing and the comb-zone extent are the same for both
                 // lanes (one shared time axis). Compute them once: the fraction
@@ -80,9 +112,9 @@ pub fn create(
                 // Amplitude lane (top): unipolar 0..1, or bipolar when polarity
                 // is on. The continuous source shape is traced behind the taps.
                 // Drag a tap to detach + set it; drag the background to nudge the
-                // amp amount; right-click a tap to relink it.
-                ui.add_space(2.0);
-                ui.label(egui::RichText::new("Amplitude").small().weak());
+                // amp amount; double-click (or right-click) a tap to relink it.
+                ui.add_space(1.0);
+                lane_header(ui, "Amplitude", &params.amp_lane);
                 let bipolar = params.polarity.value();
                 lane_widget(
                     ui,
@@ -103,8 +135,8 @@ pub fn create(
                 // Pan lane (bottom): always bipolar, centre = 0, up = R / down =
                 // L. Ping-pong shows up as the alternating zig-zag connecting the
                 // tap tips. Dragging the background nudges the ping-pong width.
-                ui.add_space(6.0);
-                ui.label(egui::RichText::new("Pan").small().weak());
+                ui.add_space(4.0);
+                lane_header(ui, "Pan", &params.pan_lane);
                 lane_widget(
                     ui,
                     &params.pan_lane,
@@ -130,53 +162,102 @@ pub fn create(
     )
 }
 
-/// One row of labelled param widgets. Each widget is a `ParamSlider` bound to a
-/// param via the `ParamSetter`, so edits go through nih-plug's gesture/automation
-/// path exactly like the generic UI.
+/// Fixed widget widths so the two control rows fit the window without the last
+/// cell (Output) scaling off the right edge.
+const SLIDER_W: f32 = 84.0;
+const COMBO_W: f32 = 96.0;
+
+/// One row of labelled param widgets bound via the `ParamSetter`, so edits go
+/// through nih-plug's gesture/automation path exactly like the generic UI.
+/// Enum params are dropdowns (a read-only current value, not a draggable
+/// slider); continuous params are fixed-width sliders.
 fn toolbar(ui: &mut egui::Ui, params: &DelayParams, setter: &ParamSetter) {
     // Two rows keep the controls readable at the default window width.
     ui.horizontal(|ui| {
         labeled(ui, "Taps", |ui| {
-            ui.add(widgets::ParamSlider::for_param(&params.tap_count, setter));
+            ui.add(widgets::ParamSlider::for_param(&params.tap_count, setter).with_width(SLIDER_W));
         });
         labeled(ui, "Time", |ui| {
-            ui.add(widgets::ParamSlider::for_param(&params.time_mode, setter));
+            enum_combo(ui, "time_mode", &params.time_mode, setter);
         });
         // Only the active time control is meaningful, but showing both keeps the
         // layout stable; the inactive one simply has no audible effect.
         match params.time_mode.value() {
             TimeMode::Sync => labeled(ui, "Division", |ui| {
-                ui.add(widgets::ParamSlider::for_param(&params.sync_division, setter));
+                enum_combo(ui, "division", &params.sync_division, setter);
             }),
             TimeMode::Free => labeled(ui, "Length", |ui| {
-                ui.add(widgets::ParamSlider::for_param(&params.free_ms, setter));
+                ui.add(widgets::ParamSlider::for_param(&params.free_ms, setter).with_width(SLIDER_W));
             }),
         };
         labeled(ui, "Mix", |ui| {
-            ui.add(widgets::ParamSlider::for_param(&params.mix, setter));
+            ui.add(widgets::ParamSlider::for_param(&params.mix, setter).with_width(SLIDER_W));
         });
     });
 
     ui.horizontal(|ui| {
         labeled(ui, "Amp Shape", |ui| {
-            ui.add(widgets::ParamSlider::for_param(&params.amp_shape, setter));
+            enum_combo(ui, "amp_shape", &params.amp_shape, setter);
         });
         labeled(ui, "Amount", |ui| {
-            ui.add(widgets::ParamSlider::for_param(&params.amp_amount, setter));
+            ui.add(widgets::ParamSlider::for_param(&params.amp_amount, setter).with_width(SLIDER_W));
         });
         labeled(ui, "Ping-Pong", |ui| {
-            ui.add(widgets::ParamSlider::for_param(&params.pingpong_amount, setter));
+            ui.add(
+                widgets::ParamSlider::for_param(&params.pingpong_amount, setter)
+                    .with_width(SLIDER_W),
+            );
         });
         labeled(ui, "Smoothing", |ui| {
-            ui.add(widgets::ParamSlider::for_param(&params.smoothing, setter));
+            ui.add(widgets::ParamSlider::for_param(&params.smoothing, setter).with_width(SLIDER_W));
         });
         labeled(ui, "Output", |ui| {
-            ui.add(widgets::ParamSlider::for_param(&params.output_trim, setter));
+            ui.add(
+                widgets::ParamSlider::for_param(&params.output_trim, setter).with_width(SLIDER_W),
+            );
         });
         labeled(ui, "Polarity", |ui| {
-            ui.add(widgets::ParamSlider::for_param(&params.polarity, setter));
+            bool_checkbox(ui, &params.polarity, setter);
+        });
+        labeled(ui, "Limiter", |ui| {
+            bool_checkbox(ui, &params.limiter, setter);
         });
     });
+}
+
+/// A checkbox bound to a `BoolParam` through the gesture path. A bool reads
+/// better as a checkbox than as a slider.
+fn bool_checkbox(ui: &mut egui::Ui, param: &BoolParam, setter: &ParamSetter) {
+    let mut on = param.value();
+    if ui.checkbox(&mut on, "").changed() {
+        setter.begin_set_parameter(param);
+        setter.set_parameter(param, on);
+        setter.end_set_parameter(param);
+    }
+}
+
+/// A dropdown for an enum param: the current value shows as read-only text and
+/// picking an entry sets the param through the gesture path.
+fn enum_combo<T>(ui: &mut egui::Ui, salt: &str, param: &EnumParam<T>, setter: &ParamSetter)
+where
+    T: Enum + Copy + PartialEq + 'static,
+{
+    let variants = T::variants();
+    let cur_idx = param.value().to_index();
+    let mut selected = cur_idx;
+    egui::ComboBox::from_id_salt(salt)
+        .selected_text(variants[cur_idx])
+        .width(COMBO_W)
+        .show_ui(ui, |ui| {
+            for (i, name) in variants.iter().enumerate() {
+                ui.selectable_value(&mut selected, i, *name);
+            }
+        });
+    if selected != cur_idx {
+        setter.begin_set_parameter(param);
+        setter.set_parameter(param, T::from_index(selected));
+        setter.end_set_parameter(param);
+    }
 }
 
 /// How a lane traces a guide line behind its taps.
@@ -279,7 +360,8 @@ impl LaneGeom {
 ///
 /// Interaction (design §7): **drag a tap** to detach + set its value; **drag the
 /// background curve** to nudge the source `amount` param, which moves every
-/// linked tap at once; **right-click a tap** to relink it to the source.
+/// linked tap at once; **double-click (or right-click) a tap** to relink it to
+/// the source so it snaps back onto the shape.
 fn lane_widget(
     ui: &mut egui::Ui,
     lock: &parking_lot::RwLock<Lane>,
@@ -349,18 +431,22 @@ fn paint_lane(ui: &egui::Ui, rect: egui::Rect, lane: &Lane, geom: &LaneGeom, vie
         label_color,
     );
 
-    let accent = visuals.selection.bg_fill;
-    let detached_color = egui::Color32::from_rgb(0xff, 0xae, 0x42); // warm amber
+    let accent = ACCENT;
+    let detached_color = DETACHED;
     let overlay_color = accent.gamma_multiply(0.4);
 
     // Guide line behind the taps.
     let overlay_pts: Vec<egui::Pos2> = match view.overlay {
         Overlay::SourceCurve => {
-            const CURVE_STEPS: usize = 96;
+            // Sample roughly once per horizontal pixel so a high-cycle shape
+            // renders smoothly. A fixed low step count would alias: too few
+            // points per cycle makes the polyline's peaks/troughs land at
+            // varying phases and look ragged, even though the taps are exact.
+            let steps = (geom.plot.width().round() as usize).clamp(64, 4096);
             let source = lane.source();
-            (0..=CURVE_STEPS)
+            (0..=steps)
                 .map(|s| {
-                    let t = s as f32 / CURVE_STEPS as f32;
+                    let t = s as f32 / steps as f32;
                     let v = source.value_at(t).clamp(geom.lo, 1.0);
                     egui::pos2(geom.plot.left() + t * geom.plot.width(), geom.y_of(v))
                 })
@@ -420,8 +506,9 @@ fn handle_lane_input(
     let geom = LaneGeom::new(rect, view.bipolar, count);
     let drag_id = egui::Id::new(("lane_drag", view.id));
 
-    // Right-click a tap to relink it to the source.
-    if response.secondary_clicked() {
+    // Double-click (or right-click) a tap to relink it: it snaps back onto the
+    // source shape, re-sampling from the curve like an unedited tap.
+    if response.double_clicked() || response.secondary_clicked() {
         if let Some(px) = response.interact_pointer_pos() {
             if let Some((i, dist)) = geom.nearest_tap(px.x) {
                 if dist <= TAP_GRAB_PX {
@@ -660,6 +747,21 @@ fn draw_meter(ui: &mut egui::Ui, level: f32) {
         egui::Stroke::new(1.0, visuals.widgets.noninteractive.bg_stroke.color),
         egui::StrokeKind::Inside,
     );
+}
+
+/// A lane's heading row: its title plus a "Reset" button that relinks every tap
+/// to the source shape, discarding manual edits.
+fn lane_header(ui: &mut egui::Ui, title: &str, lock: &parking_lot::RwLock<Lane>) {
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(title).small().weak());
+        if ui
+            .small_button("Reset")
+            .on_hover_text("Snap all taps back onto the shape")
+            .clicked()
+        {
+            lock.write().relink_all();
+        }
+    });
 }
 
 /// A small captioned cell: a label above its widget, grouped so the toolbar

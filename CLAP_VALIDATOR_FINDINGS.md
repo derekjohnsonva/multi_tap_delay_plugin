@@ -58,22 +58,20 @@ The lane's `source`, `min`/`max`, and `active` are all **derived from params**
 both redundant and the source of this nondeterminism. The only genuinely
 user-authored lane state is the **per-tap detach overrides**.
 
-### The fix
+### The fix (on `main`, PR21)
 
 `Lane` now persists **only its per-tap detach overrides** (a sparse, ascending
-`Vec<(index, value)>`), via a `#[serde(into/from = "LanePersist")]` proxy. The
-`source`, clamp `range`, and `active` count are **derived from the params** —
-which persist separately — and are reconstructed at runtime by
-`DelayParams::apply_to_lanes`, called from **both**:
+`Vec<(index, value)>`), via a hand-written `Serialize`/`Deserialize` over a
+`PersistedLane` helper. The `source`, clamp `range`, and `active` count are
+**derived from the params** — which persist separately — and re-applied each
+block (`update_taps` → `set_source`/`set_range`/`set_count`). With no
+derived/process-only state in the serialized form, the flush-path and
+process-path saves are byte-identical for identical params, so
+`state-reproducibility-flush` passes. Two `delay-core` unit tests pin it:
+`serde_round_trip_preserves_detach_overrides` and `serde_only_persists_overrides`.
 
-- the audio thread (`process` → `update_taps`, non-blocking `try_write`), and
-- the editor (a brief blocking `write` before it renders),
-
-so neither path depends on the other having run. With no derived/process-only
-state in the serialized form, the flush-path and process-path saves are
-byte-identical for identical params, and `state-reproducibility-flush` passes.
-
-Two `delay-core` unit tests pin this: `serde_round_trip_preserves_detach_overrides`
-(overrides survive; derived fields don't) and `serialization_ignores_derived_fields`
-(two lanes with different source/range/count but no overrides serialize
-identically — the exact regression).
+> Note: this branch originally carried an independent implementation of the same
+> fix (a `#[serde(into/from)]` proxy + a shared `DelayParams::apply_to_lanes`).
+> PR21 landed an equivalent fix on `main` first, so the merge defers to main's
+> version and this branch now contributes **only the validation pipeline**
+> (script + CI) — which is what surfaced the bug in the first place.
