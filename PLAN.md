@@ -148,9 +148,13 @@ delay_plugin/
 - **Done:** new `delay-core::Limiter` — a stereo feed-forward peak limiter (instantaneous attack so output never exceeds a ≈ −0.1 dBFS ceiling, ~100 ms release, no lookahead/latency) applied to the summed wet signal before the dry mix; a no-op when disabled. Wired behind a `limiter` `BoolParam` (off by default) with a toolbar checkbox. Tests: limiter caps a clipping multi-tap sum to ≤ 1.0, stays transparent when off, leaves quiet signal untouched, and releases after a peak. 67 tests pass workspace-wide; clippy clean; glibc-2.35 bundle rebuilt + installed.
 - **Not yet verified by a human:** listening test with many high-gain taps in the DAW.
 
-### PR 21 — Styling pass + state round-trip + validation
+### PR 21 — Styling pass + state round-trip + validation ✅ (pluginval pending)
 - Showcase-quality styling pass (design doc §1 goal: demo-quality look & feel). Full state save/restore validation; `clap-validator` + `pluginval` (VST3) clean runs.
-- **Verify:** project save/reload restores N, detached taps, and all params; validators pass; visual QA against the design.
+- **Done:**
+  - **Styling:** a cohesive dark theme applied once at editor startup (`apply_theme`) — defined palette (accent / detached / backgrounds / hairline), recessed lane tracks, accented controls, tighter spacing. Lane + meter drawing now reference the palette constants.
+  - **State round-trip — found & fixed a real bug:** `clap-validator`'s `state-reproducibility-flush` failed because `Lane` serialized its host-derived fields (source, active count, range), which only sync inside `process()`; an instance that only got `flush()` saved different state. Fixed with custom `serde` for `Lane` that persists **only the per-tap detach overrides** (count/source/range are always re-derived from params each block). Covered by `delay-core` serde tests + a `delay-plugin` `serialize_fields`/`deserialize_fields` round-trip test.
+  - **Validation:** `clap-validator validate` is clean — **16 passed, 0 failed, 5 skipped** (skips are note-port checks, N/A for an audio FX).
+- **Remaining / not yet verified by a human:** `pluginval` (VST3) is not installed (external JUCE binary download — needs authorization; the state fix lives in shared `Params` serialization so it applies to VST3 too); visual QA of the styling in the DAW; listening QA.
 
 ---
 

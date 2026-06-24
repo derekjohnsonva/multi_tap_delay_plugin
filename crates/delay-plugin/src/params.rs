@@ -272,4 +272,34 @@ mod tests {
         assert_eq!(params.amp_lane.read().count(), DEFAULT_TAPS as usize);
         assert_eq!(params.pan_lane.read().count(), DEFAULT_TAPS as usize);
     }
+
+    #[test]
+    fn persisted_lane_edits_survive_state_round_trip() {
+        // Author some detached tap edits, serialize the params' persistent
+        // fields (what the host saves), then restore them into a fresh instance
+        // exactly as a project reload would — and confirm the edits come back.
+        let params = DelayParams::default();
+        params.amp_lane.write().set_tap_value(2, 0.3);
+        params.pan_lane.write().set_tap_value(5, -0.7);
+
+        let saved = params.serialize_fields();
+
+        let restored = DelayParams::default();
+        restored.deserialize_fields(&saved);
+        // The plugin re-applies count from the param on the first block; mirror
+        // that so the retained edits are within the active range.
+        {
+            let mut amp = restored.amp_lane.write();
+            amp.set_count(8);
+            assert!(!amp.is_linked(2));
+            assert!((amp.value(2) - 0.3).abs() < 1e-6);
+        }
+        {
+            let mut pan = restored.pan_lane.write();
+            pan.set_range(-1.0, 1.0);
+            pan.set_count(8);
+            assert!(!pan.is_linked(5));
+            assert!((pan.value(5) + 0.7).abs() < 1e-6);
+        }
+    }
 }

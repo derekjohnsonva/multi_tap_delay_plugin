@@ -105,7 +105,7 @@ enum LinkState {
 /// discarded — `taps` is a high-water-mark store and `active` marks how many
 /// of them are currently live. Shrinking just lowers `active`; re-growing
 /// revives the retained taps with their stored edits intact.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug)]
 pub struct Lane {
     source: LaneSource,
     /// Resolved values are clamped to this inclusive range.
@@ -113,6 +113,61 @@ pub struct Lane {
     max: f32,
     taps: Vec<LinkState>,
     active: usize,
+}
+
+/// On-disk form of a lane: **only** the per-tap detach overrides. The source,
+/// active count, and clamp range are all re-derived from the plugin params each
+/// block, so persisting them would make a saved state depend on whether
+/// `process()` ran before the save (the `state-reproducibility-flush` check).
+/// Persisting just the overrides keeps the user's authored edits — including
+/// taps retained beyond the active count (so shrink → save → reload → grow
+/// restores them) — and nothing host-derived.
+#[derive(Serialize, Deserialize)]
+struct PersistedLane {
+    /// `(tap index, override value)` for every detached tap.
+    overrides: Vec<(usize, f32)>,
+}
+
+impl Serialize for Lane {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let overrides = self
+            .taps
+            .iter()
+            .enumerate()
+            .filter_map(|(i, t)| match *t {
+                LinkState::Detached(v) => Some((i, v)),
+                LinkState::Linked => None,
+            })
+            .collect();
+        PersistedLane { overrides }.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Lane {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let persisted = PersistedLane::deserialize(deserializer)?;
+        let len = persisted
+            .overrides
+            .iter()
+            .map(|(i, _)| i + 1)
+            .max()
+            .unwrap_or(0);
+        let mut taps = vec![LinkState::Linked; len];
+        for (i, v) in persisted.overrides {
+            if i < taps.len() {
+                taps[i] = LinkState::Detached(v);
+            }
+        }
+        // Placeholders for the host-derived fields; the plugin overwrites them
+        // via set_source / set_range / set_count on the first processed block.
+        Ok(Lane {
+            source: LaneSource::Constant(1.0),
+            min: 0.0,
+            max: 1.0,
+            taps,
+            active: len,
+        })
+    }
 }
 
 impl Lane {
@@ -379,12 +434,30 @@ mod tests {
         lane.set_tap_value(3, 0.123); // a detached edit
         lane.set_count(2); // shrink (retains the edit beyond active)
         let json = serde_json::to_string(&lane).unwrap();
-        let restored: Lane = serde_json::from_str(&json).unwrap();
-        assert_eq!(restored.count(), 2);
-        // Re-growing the restored lane brings the persisted edit back.
-        let mut restored = restored;
+        let mut restored: Lane = serde_json::from_str(&json).unwrap();
+        // Count/source/range are NOT persisted (they come from the params each
+        // block); the plugin re-applies them on load. Simulate that, then check
+        // the detached edit survived and reappears when the lane grows back.
+        restored.set_source(LaneSource::ExpDecay { k: 2.0 });
+        restored.set_range(0.0, 1.0);
         restored.set_count(6);
         approx(restored.value(3), 0.123);
+        assert!(!restored.is_linked(3));
+        // A linked tap follows the (re-applied) source rather than a stored value.
+        assert!(restored.is_linked(0));
+    }
+
+    #[test]
+    fn serde_only_persists_overrides() {
+        // No edits -> an all-linked lane serializes to an empty override set,
+        // independent of count/source, which is what keeps saved state
+        // reproducible whether or not process() has run.
+        let a = Lane::new(LaneSource::ExpDecay { k: 5.0 }, (0.0, 1.0), 8);
+        let b = Lane::new(LaneSource::Sine { cycles: 3.0, phase: 0.0 }, (-1.0, 1.0), 3);
+        assert_eq!(
+            serde_json::to_string(&a).unwrap(),
+            serde_json::to_string(&b).unwrap()
+        );
     }
 
     #[test]

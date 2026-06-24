@@ -1,12 +1,14 @@
-//! PR 14–15 — egui editor: toolbar (PR 14) + amplitude lane rendering (PR 15).
+//! The egui editor (design §7): a toolbar of global controls over two stacked,
+//! directly-editable lanes (amplitude + pan) sharing one time axis, with an
+//! always-visible output meter at the right edge.
 //!
-//! The toolbar wires the global controls (design §7) to the same params the
-//! generic UI exposes. Below it, PR 15 adds the first custom-drawn lane: the
-//! **amplitude** lane (design §7) — stems/lollipops rising from a baseline with
-//! the source curve traced behind them, linked vs. detached taps drawn
-//! distinctly, and a bipolar layout when polarity is on. This view is read-only
-//! for now; direct lane interaction (dragging taps/curve) arrives in PR 19. The
-//! pan lane, shared time axis, and meter follow in PR 16–18.
+//! - Toolbar wires every global param through the `ParamSetter` gesture path
+//!   (enum params as dropdowns, bools as checkboxes, the rest as sliders).
+//! - Each lane draws the source shape behind per-tap stems/lollipops, with
+//!   linked vs. detached taps distinct; drag a tap to set it, drag the curve to
+//!   nudge the shape amount, double/right-click to relink, "Reset" to relink all.
+//! - The time axis labels switch ms ↔ note-division by mode and shades the
+//!   comb zone; the meter shows the post-trim peak with a clip zone.
 
 use crate::params::{DelayParams, NoteDivision, TimeMode};
 use delay_core::{Lane, COMB_ZONE_MS};
@@ -19,6 +21,43 @@ use std::sync::Arc;
 /// axis so their tap x-positions line up exactly.
 const PLOT_PAD: f32 = 8.0;
 
+// --- Palette (design §1: demo-quality look) -------------------------------
+/// Primary accent: curves, linked taps, selection.
+const ACCENT: egui::Color32 = egui::Color32::from_rgb(0x4d, 0xa6, 0xff);
+/// Detached / manually-edited taps.
+const DETACHED: egui::Color32 = egui::Color32::from_rgb(0xff, 0xae, 0x42);
+/// Window / panel background.
+const BG: egui::Color32 = egui::Color32::from_rgb(0x17, 0x1a, 0x1f);
+/// Recessed lane-track / meter background.
+const TRACK: egui::Color32 = egui::Color32::from_rgb(0x0e, 0x10, 0x14);
+/// Hairline borders around panels.
+const HAIRLINE: egui::Color32 = egui::Color32::from_rgb(0x2b, 0x31, 0x3a);
+
+/// Apply the plugin's dark theme once at editor creation (design §1 — a
+/// cohesive, demo-quality look rather than raw egui defaults).
+fn apply_theme(ctx: &egui::Context) {
+    let mut v = egui::Visuals::dark();
+    v.panel_fill = BG;
+    v.window_fill = BG;
+    v.extreme_bg_color = TRACK;
+    v.faint_bg_color = egui::Color32::from_rgb(0x1d, 0x21, 0x28);
+    v.selection.bg_fill = ACCENT.gamma_multiply(0.4);
+    v.selection.stroke = egui::Stroke::new(1.0, ACCENT);
+    v.hyperlink_color = ACCENT;
+    v.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, HAIRLINE);
+    // Accent the controls' fills so sliders/checkboxes read as one family.
+    v.widgets.inactive.bg_fill = egui::Color32::from_rgb(0x23, 0x29, 0x32);
+    v.widgets.inactive.weak_bg_fill = egui::Color32::from_rgb(0x23, 0x29, 0x32);
+    v.widgets.hovered.bg_fill = egui::Color32::from_rgb(0x2c, 0x34, 0x40);
+    v.widgets.active.bg_fill = ACCENT.gamma_multiply(0.6);
+    ctx.set_visuals(v);
+
+    let mut style = (*ctx.style()).clone();
+    style.spacing.item_spacing = egui::vec2(8.0, 6.0);
+    style.spacing.button_padding = egui::vec2(7.0, 3.0);
+    ctx.set_style(style);
+}
+
 /// Build the editor. Returns `None` only if the host can't host an egui window.
 pub fn create(
     params: Arc<DelayParams>,
@@ -29,7 +68,7 @@ pub fn create(
     create_egui_editor(
         egui_state,
         (),
-        |_, _| {},
+        |ctx, _| apply_theme(ctx),
         move |ctx, setter, _state| {
             egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
                 ui.add_space(3.0);
@@ -392,8 +431,8 @@ fn paint_lane(ui: &egui::Ui, rect: egui::Rect, lane: &Lane, geom: &LaneGeom, vie
         label_color,
     );
 
-    let accent = visuals.selection.bg_fill;
-    let detached_color = egui::Color32::from_rgb(0xff, 0xae, 0x42); // warm amber
+    let accent = ACCENT;
+    let detached_color = DETACHED;
     let overlay_color = accent.gamma_multiply(0.4);
 
     // Guide line behind the taps.
