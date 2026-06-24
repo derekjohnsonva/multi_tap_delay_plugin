@@ -32,9 +32,10 @@ pub fn create(
         |_, _| {},
         move |ctx, setter, _state| {
             egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
-                ui.add_space(4.0);
+                ui.add_space(3.0);
                 toolbar(ui, &params, setter);
-                ui.add_space(4.0);
+                // Keep the controls tucked just above the graphs.
+                ui.add_space(1.0);
             });
 
             // Output meter pinned to the right edge, always visible (design §7).
@@ -73,8 +74,8 @@ pub fn create(
                 // is on. The continuous source shape is traced behind the taps.
                 // Drag a tap to detach + set it; drag the background to nudge the
                 // amp amount; double-click (or right-click) a tap to relink it.
-                ui.add_space(2.0);
-                ui.label(egui::RichText::new("Amplitude").small().weak());
+                ui.add_space(1.0);
+                lane_header(ui, "Amplitude", &params.amp_lane);
                 let bipolar = params.polarity.value();
                 lane_widget(
                     ui,
@@ -95,8 +96,8 @@ pub fn create(
                 // Pan lane (bottom): always bipolar, centre = 0, up = R / down =
                 // L. Ping-pong shows up as the alternating zig-zag connecting the
                 // tap tips. Dragging the background nudges the ping-pong width.
-                ui.add_space(6.0);
-                ui.label(egui::RichText::new("Pan").small().weak());
+                ui.add_space(4.0);
+                lane_header(ui, "Pan", &params.pan_lane);
                 lane_widget(
                     ui,
                     &params.pan_lane,
@@ -122,53 +123,94 @@ pub fn create(
     )
 }
 
-/// One row of labelled param widgets. Each widget is a `ParamSlider` bound to a
-/// param via the `ParamSetter`, so edits go through nih-plug's gesture/automation
-/// path exactly like the generic UI.
+/// Fixed widget widths so the two control rows fit the window without the last
+/// cell (Output) scaling off the right edge.
+const SLIDER_W: f32 = 84.0;
+const COMBO_W: f32 = 96.0;
+
+/// One row of labelled param widgets bound via the `ParamSetter`, so edits go
+/// through nih-plug's gesture/automation path exactly like the generic UI.
+/// Enum params are dropdowns (a read-only current value, not a draggable
+/// slider); continuous params are fixed-width sliders.
 fn toolbar(ui: &mut egui::Ui, params: &DelayParams, setter: &ParamSetter) {
     // Two rows keep the controls readable at the default window width.
     ui.horizontal(|ui| {
         labeled(ui, "Taps", |ui| {
-            ui.add(widgets::ParamSlider::for_param(&params.tap_count, setter));
+            ui.add(widgets::ParamSlider::for_param(&params.tap_count, setter).with_width(SLIDER_W));
         });
         labeled(ui, "Time", |ui| {
-            ui.add(widgets::ParamSlider::for_param(&params.time_mode, setter));
+            enum_combo(ui, "time_mode", &params.time_mode, setter);
         });
         // Only the active time control is meaningful, but showing both keeps the
         // layout stable; the inactive one simply has no audible effect.
         match params.time_mode.value() {
             TimeMode::Sync => labeled(ui, "Division", |ui| {
-                ui.add(widgets::ParamSlider::for_param(&params.sync_division, setter));
+                enum_combo(ui, "division", &params.sync_division, setter);
             }),
             TimeMode::Free => labeled(ui, "Length", |ui| {
-                ui.add(widgets::ParamSlider::for_param(&params.free_ms, setter));
+                ui.add(widgets::ParamSlider::for_param(&params.free_ms, setter).with_width(SLIDER_W));
             }),
         };
         labeled(ui, "Mix", |ui| {
-            ui.add(widgets::ParamSlider::for_param(&params.mix, setter));
+            ui.add(widgets::ParamSlider::for_param(&params.mix, setter).with_width(SLIDER_W));
         });
     });
 
     ui.horizontal(|ui| {
         labeled(ui, "Amp Shape", |ui| {
-            ui.add(widgets::ParamSlider::for_param(&params.amp_shape, setter));
+            enum_combo(ui, "amp_shape", &params.amp_shape, setter);
         });
         labeled(ui, "Amount", |ui| {
-            ui.add(widgets::ParamSlider::for_param(&params.amp_amount, setter));
+            ui.add(widgets::ParamSlider::for_param(&params.amp_amount, setter).with_width(SLIDER_W));
         });
         labeled(ui, "Ping-Pong", |ui| {
-            ui.add(widgets::ParamSlider::for_param(&params.pingpong_amount, setter));
+            ui.add(
+                widgets::ParamSlider::for_param(&params.pingpong_amount, setter)
+                    .with_width(SLIDER_W),
+            );
         });
         labeled(ui, "Smoothing", |ui| {
-            ui.add(widgets::ParamSlider::for_param(&params.smoothing, setter));
+            ui.add(widgets::ParamSlider::for_param(&params.smoothing, setter).with_width(SLIDER_W));
         });
         labeled(ui, "Output", |ui| {
-            ui.add(widgets::ParamSlider::for_param(&params.output_trim, setter));
+            ui.add(
+                widgets::ParamSlider::for_param(&params.output_trim, setter).with_width(SLIDER_W),
+            );
         });
         labeled(ui, "Polarity", |ui| {
-            ui.add(widgets::ParamSlider::for_param(&params.polarity, setter));
+            // A bool reads better as a checkbox than a slider.
+            let mut on = params.polarity.value();
+            if ui.checkbox(&mut on, "").changed() {
+                setter.begin_set_parameter(&params.polarity);
+                setter.set_parameter(&params.polarity, on);
+                setter.end_set_parameter(&params.polarity);
+            }
         });
     });
+}
+
+/// A dropdown for an enum param: the current value shows as read-only text and
+/// picking an entry sets the param through the gesture path.
+fn enum_combo<T>(ui: &mut egui::Ui, salt: &str, param: &EnumParam<T>, setter: &ParamSetter)
+where
+    T: Enum + Copy + PartialEq + 'static,
+{
+    let variants = T::variants();
+    let cur_idx = param.value().to_index();
+    let mut selected = cur_idx;
+    egui::ComboBox::from_id_salt(salt)
+        .selected_text(variants[cur_idx])
+        .width(COMBO_W)
+        .show_ui(ui, |ui| {
+            for (i, name) in variants.iter().enumerate() {
+                ui.selectable_value(&mut selected, i, *name);
+            }
+        });
+    if selected != cur_idx {
+        setter.begin_set_parameter(param);
+        setter.set_parameter(param, T::from_index(selected));
+        setter.end_set_parameter(param);
+    }
 }
 
 /// How a lane traces a guide line behind its taps.
@@ -654,6 +696,21 @@ fn draw_meter(ui: &mut egui::Ui, level: f32) {
         egui::Stroke::new(1.0, visuals.widgets.noninteractive.bg_stroke.color),
         egui::StrokeKind::Inside,
     );
+}
+
+/// A lane's heading row: its title plus a "Reset" button that relinks every tap
+/// to the source shape, discarding manual edits.
+fn lane_header(ui: &mut egui::Ui, title: &str, lock: &parking_lot::RwLock<Lane>) {
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(title).small().weak());
+        if ui
+            .small_button("Reset")
+            .on_hover_text("Snap all taps back onto the shape")
+            .clicked()
+        {
+            lock.write().relink_all();
+        }
+    });
 }
 
 /// A small captioned cell: a label above its widget, grouped so the toolbar

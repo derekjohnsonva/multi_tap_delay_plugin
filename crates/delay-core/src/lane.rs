@@ -201,6 +201,16 @@ impl Lane {
         }
     }
 
+    /// Relink every tap so the whole lane snaps back onto the source shape,
+    /// discarding all detach overrides (the editor's per-lane "reset" button).
+    /// Clears stored overrides beyond the active count too, so re-growing the
+    /// lane doesn't revive old edits.
+    pub fn relink_all(&mut self) {
+        for tap in &mut self.taps {
+            *tap = LinkState::Linked;
+        }
+    }
+
     /// Set tap `index` to an explicit value, detaching it if needed. This is
     /// what dragging a tap in the editor calls. No-op if out of range.
     pub fn set_tap_value(&mut self, index: usize, value: f32) {
@@ -415,6 +425,24 @@ mod tests {
         approx(lane.value(1), 0.8); // revived edit
         assert!(lane.is_linked(5)); // freshly appended
         approx(lane.value(5), 0.3);
+    }
+
+    #[test]
+    fn relink_all_resets_every_tap_to_the_source() {
+        let mut lane = Lane::new(LaneSource::Constant(0.5), (0.0, 1.0), 4);
+        lane.set_tap_value(0, 0.1);
+        lane.set_tap_value(2, 0.9);
+        lane.set_count(2); // leaves a detached edit stored beyond active
+        lane.relink_all();
+        // All active taps follow the source again.
+        for i in 0..lane.count() {
+            assert!(lane.is_linked(i));
+            approx(lane.value(i), 0.5);
+        }
+        // ...and the stored override at index 2 is gone, so re-growing is clean.
+        lane.set_count(4);
+        assert!(lane.is_linked(2));
+        approx(lane.value(2), 0.5);
     }
 
     #[test]

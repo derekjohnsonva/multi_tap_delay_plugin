@@ -85,11 +85,14 @@ pub enum AmpShape {
 impl AmpShape {
     /// Map the shape + a normalized `amount` knob to a concrete [`LaneSource`].
     pub fn to_source(self, amount: f32) -> LaneSource {
-        // Shapes that take a "cycles" parameter share this 0.5..4 mapping.
-        let cycles = 0.5 + amount * 3.5;
+        // Wave shapes span 0.5 periods (barely a swell) up to ~16 periods at
+        // full amount, so dense tap counts can show plenty of cycles.
+        let cycles = 0.5 + amount * 15.5;
         match self {
             AmpShape::Flat => LaneSource::Constant(1.0),
-            AmpShape::ExpDecay => LaneSource::ExpDecay { k: amount * 6.0 },
+            // Steep enough that at full amount the second tap is ~silent
+            // (exp(-30·x); with the default ~8 taps the second tap ≈ 0.01).
+            AmpShape::ExpDecay => LaneSource::ExpDecay { k: amount * 30.0 },
             AmpShape::Sine => LaneSource::Sine { cycles, phase: 0.0 },
             AmpShape::Saw => LaneSource::Saw { cycles },
             AmpShape::Triangle => LaneSource::Triangle { cycles },
@@ -234,13 +237,26 @@ mod tests {
     #[test]
     fn amp_shapes_map_to_sources() {
         assert_eq!(AmpShape::Flat.to_source(0.5), LaneSource::Constant(1.0));
-        assert_eq!(AmpShape::ExpDecay.to_source(0.5), LaneSource::ExpDecay { k: 3.0 });
+        assert_eq!(AmpShape::ExpDecay.to_source(0.5), LaneSource::ExpDecay { k: 15.0 });
+        // At full amount the exp decay is steep enough to silence the 2nd tap.
+        if let LaneSource::ExpDecay { k } = AmpShape::ExpDecay.to_source(1.0) {
+            let second_tap = delay_core::curves::exp_decay(1.0 / 7.0, k); // 8 taps
+            assert!(second_tap < 0.05, "second tap should be ~0, got {second_tap}");
+        } else {
+            panic!("expected ExpDecay");
+        }
         match AmpShape::Sine.to_source(0.0) {
             LaneSource::Sine { cycles, phase } => {
                 assert!((cycles - 0.5).abs() < 1e-6);
                 assert_eq!(phase, 0.0);
             }
             other => panic!("expected Sine, got {other:?}"),
+        }
+        // Full amount yields many more than the old 4-period ceiling.
+        if let LaneSource::Sine { cycles, .. } = AmpShape::Sine.to_source(1.0) {
+            assert!(cycles >= 12.0, "want many periods at full amount, got {cycles}");
+        } else {
+            panic!("expected Sine");
         }
     }
 
