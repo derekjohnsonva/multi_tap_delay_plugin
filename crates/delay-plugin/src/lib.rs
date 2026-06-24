@@ -172,6 +172,8 @@ impl Plugin for DelayPlugin {
         self.engine.set_mix(self.params.mix.value());
         self.engine
             .set_output_trim(util::db_to_gain(self.params.output_trim.value()));
+        self.engine
+            .set_limiter_enabled(self.params.limiter.value());
 
         // Stereo in-place processing. Our only IO layout is stereo, but guard
         // the channel count so a mono host config can't panic.

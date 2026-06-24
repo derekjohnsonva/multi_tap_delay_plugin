@@ -141,6 +141,9 @@ pub struct DelayParams {
     #[id = "polarity"]
     pub polarity: BoolParam,
 
+    #[id = "limiter"]
+    pub limiter: BoolParam,
+
     #[id = "ampshape"]
     pub amp_shape: EnumParam<AmpShape>,
 
@@ -205,6 +208,8 @@ impl Default for DelayParams {
             .with_value_to_string(formatters::v2s_f32_rounded(1)),
 
             polarity: BoolParam::new("Polarity", false),
+
+            limiter: BoolParam::new("Limiter", false),
 
             amp_shape: EnumParam::new("Amp Shape", AmpShape::ExpDecay),
             amp_amount: FloatParam::new("Amp Amount", 0.5, FloatRange::Linear { min: 0.0, max: 1.0 })

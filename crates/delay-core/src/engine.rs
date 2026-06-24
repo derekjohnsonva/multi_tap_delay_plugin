@@ -8,6 +8,7 @@
 //! No feedback ⇒ unconditionally stable ⇒ arbitrary per-tap gains are safe.
 
 use crate::buffer::DelayLine;
+use crate::limiter::Limiter;
 use crate::pan::equal_power;
 use crate::smoothing::OnePole;
 
@@ -55,6 +56,7 @@ pub struct Engine {
     taps: Vec<TapState>,
     mix: OnePole,
     output_trim: OnePole,
+    limiter: Limiter,
     smoothing_ms: f32,
     /// Decaying peak of the post-trim output (max across L/R), for the editor's
     /// always-visible output meter (design §4/§7). Updated per sample; rises
@@ -87,6 +89,7 @@ impl Engine {
             taps: Vec::new(),
             mix,
             output_trim,
+            limiter: Limiter::new(sample_rate),
             smoothing_ms,
             meter_peak: 0.0,
             meter_release: meter_release_coeff(sample_rate),
@@ -97,6 +100,7 @@ impl Engine {
     pub fn reset(&mut self) {
         self.left.reset();
         self.right.reset();
+        self.limiter.reset();
         self.meter_peak = 0.0;
         for t in &mut self.taps {
             t.gain.set_immediate(t.gain.value());
@@ -129,6 +133,11 @@ impl Engine {
     /// Linear output gain applied after the dry/wet mix.
     pub fn set_output_trim(&mut self, gain: f32) {
         self.output_trim.set_target(gain.max(0.0));
+    }
+
+    /// Enable/disable the optional safety limiter on the summed wet signal.
+    pub fn set_limiter_enabled(&mut self, enabled: bool) {
+        self.limiter.set_enabled(enabled);
     }
 
     /// Number of tap slots the engine is processing, including any that are
@@ -199,6 +208,10 @@ impl Engine {
             wet_l += src * gain * lg;
             wet_r += src * gain * rg;
         }
+
+        // Optional safety limiter on the summed wet signal (before the dry mix,
+        // so the dry path stays untouched). A no-op when disabled.
+        let (wet_l, wet_r) = self.limiter.process(wet_l, wet_r);
 
         let mix = self.mix.next();
         let trim = self.output_trim.next();
@@ -351,6 +364,29 @@ mod tests {
         // Once faded, a later update garbage-collects the dead slot.
         eng.set_taps(&[Tap::new(1.0, 1.0, 0.0)]);
         assert_eq!(eng.num_taps(), 1, "faded-out tap is dropped");
+    }
+
+    #[test]
+    fn limiter_bounds_summed_output() {
+        // Eight centered taps at full gain stacked at the same delay sum to ~8x,
+        // which clips hard. With the limiter on, the wet output stays bounded.
+        let taps: Vec<Tap> = (0..8).map(|_| Tap::new(1.0, 1.0, 0.0)).collect();
+
+        let mut without = settled_engine(&taps, 1.0);
+        let mut with = settled_engine(&taps, 1.0);
+        with.set_limiter_enabled(true);
+
+        without.process_sample(1.0, 1.0);
+        with.process_sample(1.0, 1.0);
+        let (mut max_off, mut max_on): (f32, f32) = (0.0, 0.0);
+        for _ in 0..200 {
+            let off = without.process_sample(0.0, 0.0);
+            let on = with.process_sample(0.0, 0.0);
+            max_off = max_off.max(off.0.abs()).max(off.1.abs());
+            max_on = max_on.max(on.0.abs()).max(on.1.abs());
+        }
+        assert!(max_off > 1.0, "unlimited sum should clip, got {max_off}");
+        assert!(max_on <= 1.0, "limited sum should stay bounded, got {max_on}");
     }
 
     #[test]

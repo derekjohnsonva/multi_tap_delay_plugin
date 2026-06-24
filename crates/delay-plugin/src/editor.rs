@@ -178,15 +178,23 @@ fn toolbar(ui: &mut egui::Ui, params: &DelayParams, setter: &ParamSetter) {
             );
         });
         labeled(ui, "Polarity", |ui| {
-            // A bool reads better as a checkbox than a slider.
-            let mut on = params.polarity.value();
-            if ui.checkbox(&mut on, "").changed() {
-                setter.begin_set_parameter(&params.polarity);
-                setter.set_parameter(&params.polarity, on);
-                setter.end_set_parameter(&params.polarity);
-            }
+            bool_checkbox(ui, &params.polarity, setter);
+        });
+        labeled(ui, "Limiter", |ui| {
+            bool_checkbox(ui, &params.limiter, setter);
         });
     });
+}
+
+/// A checkbox bound to a `BoolParam` through the gesture path. A bool reads
+/// better as a checkbox than as a slider.
+fn bool_checkbox(ui: &mut egui::Ui, param: &BoolParam, setter: &ParamSetter) {
+    let mut on = param.value();
+    if ui.checkbox(&mut on, "").changed() {
+        setter.begin_set_parameter(param);
+        setter.set_parameter(param, on);
+        setter.end_set_parameter(param);
+    }
 }
 
 /// A dropdown for an enum param: the current value shows as read-only text and

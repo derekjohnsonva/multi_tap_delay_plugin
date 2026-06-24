@@ -143,9 +143,10 @@ delay_plugin/
 
 ## Phase 5 — Polish & release-readiness
 
-### PR 20 — Optional safety limiter on wet path
+### PR 20 — Optional safety limiter on wet path ✅
 - Optional limiter on the summed wet signal (design doc §4 — summed taps exceed 0 dBFS easily). Toggle/visible in UI.
-- **Verify:** with many high-gain taps, output stays bounded; bypassed limiter leaves signal untouched.
+- **Done:** new `delay-core::Limiter` — a stereo feed-forward peak limiter (instantaneous attack so output never exceeds a ≈ −0.1 dBFS ceiling, ~100 ms release, no lookahead/latency) applied to the summed wet signal before the dry mix; a no-op when disabled. Wired behind a `limiter` `BoolParam` (off by default) with a toolbar checkbox. Tests: limiter caps a clipping multi-tap sum to ≤ 1.0, stays transparent when off, leaves quiet signal untouched, and releases after a peak. 67 tests pass workspace-wide; clippy clean; glibc-2.35 bundle rebuilt + installed.
+- **Not yet verified by a human:** listening test with many high-gain taps in the DAW.
 
 ### PR 21 — Styling pass + state round-trip + validation
 - Showcase-quality styling pass (design doc §1 goal: demo-quality look & feel). Full state save/restore validation; `clap-validator` + `pluginval` (VST3) clean runs.
