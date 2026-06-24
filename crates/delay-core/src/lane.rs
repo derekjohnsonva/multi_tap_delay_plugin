@@ -70,6 +70,24 @@ impl LaneSource {
             }
         }
     }
+
+    /// Raw (unclamped) value at an arbitrary normalized position `x ∈ [0, 1]`,
+    /// for drawing the continuous source as a smooth curve behind the discrete
+    /// taps (editor curve overlay, design §7). The continuous shapes evaluate
+    /// their underlying curve directly; the index-based [`LaneSource::PingPong`]
+    /// has no continuous form, so this returns its (unsigned) magnitude envelope
+    /// `width·(1 + widen·x)`, which is what a pan overlay would trace.
+    pub fn value_at(&self, x: f32) -> f32 {
+        match *self {
+            LaneSource::Constant(v) => v,
+            LaneSource::Ramp { start, end } => start + (end - start) * x,
+            LaneSource::Sine { cycles, phase } => curves::sine(x, cycles, phase),
+            LaneSource::Saw { cycles } => curves::saw(x, cycles),
+            LaneSource::Triangle { cycles } => curves::triangle(x, cycles),
+            LaneSource::ExpDecay { k } => curves::exp_decay(x, k),
+            LaneSource::PingPong { width, widen } => (width * (1.0 + widen * x)).clamp(0.0, 1.0),
+        }
+    }
 }
 
 /// Per-tap link state.
@@ -277,6 +295,33 @@ mod tests {
         approx(lane.value(0), 0.0);
         approx(lane.value(2), 1.0);
         approx(lane.value(4), 0.0);
+    }
+
+    #[test]
+    fn value_at_matches_tap_sampling_for_continuous_shapes() {
+        // The continuous overlay must pass through the discrete taps it draws
+        // behind: value_at(x_of(i, n)) == value(i, n) for the curve shapes.
+        for src in [
+            LaneSource::Constant(0.7),
+            LaneSource::Ramp { start: 0.2, end: 0.9 },
+            LaneSource::Sine { cycles: 2.0, phase: 0.1 },
+            LaneSource::Saw { cycles: 1.5 },
+            LaneSource::Triangle { cycles: 1.0 },
+            LaneSource::ExpDecay { k: 3.0 },
+        ] {
+            let count = 5;
+            for i in 0..count {
+                let x = LaneSource::x_of(i, count);
+                approx(src.value_at(x), src.value(i, count));
+            }
+        }
+    }
+
+    #[test]
+    fn value_at_ping_pong_is_positive_magnitude_envelope() {
+        let src = LaneSource::PingPong { width: 0.5, widen: 1.0 };
+        approx(src.value_at(0.0), 0.5); // width at the start
+        approx(src.value_at(1.0), 1.0); // widened to 0.5*2 at the end
     }
 
     #[test]

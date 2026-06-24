@@ -1,13 +1,15 @@
-//! PR 14 — egui editor scaffold + toolbar.
+//! PR 14–15 — egui editor: toolbar (PR 14) + amplitude lane rendering (PR 15).
 //!
-//! A first editor window built with `nih_plug_egui`. This PR only wires the
-//! global toolbar controls (design §7) to the existing params — the same params
-//! the generic UI exposes — so moving a widget here is identical to moving it in
-//! the host's generic view and audibly changes the delay. The custom lane
-//! drawing, time axis, meter, and direct lane interaction land in PR 15–19; the
-//! large area below the toolbar is intentionally left as a placeholder for them.
+//! The toolbar wires the global controls (design §7) to the same params the
+//! generic UI exposes. Below it, PR 15 adds the first custom-drawn lane: the
+//! **amplitude** lane (design §7) — stems/lollipops rising from a baseline with
+//! the source curve traced behind them, linked vs. detached taps drawn
+//! distinctly, and a bipolar layout when polarity is on. This view is read-only
+//! for now; direct lane interaction (dragging taps/curve) arrives in PR 19. The
+//! pan lane, shared time axis, and meter follow in PR 16–18.
 
 use crate::params::{DelayParams, TimeMode};
+use delay_core::Lane;
 use nih_plug::prelude::*;
 use nih_plug_egui::{create_egui_editor, egui, widgets};
 use std::sync::Arc;
@@ -27,14 +29,21 @@ pub fn create(params: Arc<DelayParams>) -> Option<Box<dyn Editor>> {
             });
 
             egui::CentralPanel::default().show(ctx, |ui| {
-                ui.vertical_centered(|ui| {
-                    ui.add_space(ui.available_height() * 0.5 - 12.0);
-                    ui.label(
-                        egui::RichText::new("Lanes, time axis & meter — coming in PR 15–18")
-                            .weak()
-                            .italics(),
-                    );
-                });
+                ui.add_space(2.0);
+                ui.label(egui::RichText::new("Amplitude").small().weak());
+                // The audio thread keeps `amp_lane`'s source/count/range in sync
+                // with the params each block, so reading it here yields the live
+                // per-tap gains. A blocking read is fine: the audio thread only
+                // ever `try_write`s, so it never waits on the GUI.
+                let bipolar = params.polarity.value();
+                draw_amp_lane(ui, &params.amp_lane.read(), bipolar);
+
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new("Pan lane, time axis & meter — coming in PR 16–18")
+                        .weak()
+                        .italics(),
+                );
             });
         },
     )
@@ -87,6 +96,97 @@ fn toolbar(ui: &mut egui::Ui, params: &DelayParams, setter: &ParamSetter) {
             ui.add(widgets::ParamSlider::for_param(&params.polarity, setter));
         });
     });
+}
+
+/// Draw the amplitude lane (design §7): the source curve traced as a smooth
+/// overlay, with each tap as a stem rising from the baseline to a lollipop at
+/// its resolved gain. Linked taps follow the curve and render in the accent
+/// colour; detached taps (per-tap overrides) render as a distinct hollow marker
+/// so manual edits stand out. With polarity on the lane is bipolar (baseline in
+/// the middle, stems up for positive and down for negative gain); otherwise it
+/// is unipolar with the baseline at the bottom. Read-only here — PR 19 makes the
+/// taps and curve draggable.
+fn draw_amp_lane(ui: &mut egui::Ui, lane: &Lane, bipolar: bool) {
+    // Take all the width and a fixed slice of height; the rest of the central
+    // panel is reserved for the pan lane + meter (PR 16/18).
+    let height = (ui.available_height() - 28.0).clamp(80.0, 220.0);
+    let (rect, _response) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), height), egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+    let visuals = ui.visuals();
+
+    // Panel background + frame.
+    painter.rect_filled(rect, 4.0, visuals.extreme_bg_color);
+    painter.rect_stroke(
+        rect,
+        4.0,
+        egui::Stroke::new(1.0, visuals.widgets.noninteractive.bg_stroke.color),
+        egui::StrokeKind::Inside,
+    );
+
+    let pad = 8.0;
+    let plot = rect.shrink(pad);
+    // Value 1.0 reaches the top; the baseline sits at the bottom (unipolar) or
+    // the vertical centre (bipolar). `max` is the full-scale value (always 1.0).
+    let baseline_y = if bipolar { plot.center().y } else { plot.bottom() };
+    let half = if bipolar { plot.height() * 0.5 } else { plot.height() };
+    let value_to_y = |v: f32| baseline_y - v * half;
+    let lo = if bipolar { -1.0 } else { 0.0 };
+
+    let count = lane.count();
+    // Single tap sits at the left edge of the curve; otherwise spread across.
+    let index_to_x = |i: usize| {
+        let t = if count <= 1 {
+            0.0
+        } else {
+            i as f32 / (count - 1) as f32
+        };
+        plot.left() + t * plot.width()
+    };
+
+    // Baseline.
+    painter.line_segment(
+        [
+            egui::pos2(plot.left(), baseline_y),
+            egui::pos2(plot.right(), baseline_y),
+        ],
+        egui::Stroke::new(1.0, visuals.weak_text_color()),
+    );
+
+    let accent = visuals.selection.bg_fill;
+    let detached_color = egui::Color32::from_rgb(0xff, 0xae, 0x42); // warm amber
+
+    // Source curve overlay, sampled continuously across the lane width.
+    const CURVE_STEPS: usize = 96;
+    let curve_color = accent.gamma_multiply(0.4);
+    let source = lane.source();
+    let curve: Vec<egui::Pos2> = (0..=CURVE_STEPS)
+        .map(|s| {
+            let t = s as f32 / CURVE_STEPS as f32;
+            let v = source.value_at(t).clamp(lo, 1.0);
+            egui::pos2(plot.left() + t * plot.width(), value_to_y(v))
+        })
+        .collect();
+    painter.add(egui::Shape::line(curve, egui::Stroke::new(1.5, curve_color)));
+
+    // Stems + lollipops for each tap.
+    for i in 0..count {
+        let v = lane.value(i);
+        let x = index_to_x(i);
+        let tip = egui::pos2(x, value_to_y(v));
+        let base = egui::pos2(x, baseline_y);
+        let linked = lane.is_linked(i);
+        let color = if linked { accent } else { detached_color };
+
+        painter.line_segment([base, tip], egui::Stroke::new(1.5, color));
+        if linked {
+            painter.circle_filled(tip, 3.5, color);
+        } else {
+            // Hollow marker distinguishes a detached, manually-set tap.
+            painter.circle_filled(tip, 3.5, visuals.extreme_bg_color);
+            painter.circle_stroke(tip, 3.5, egui::Stroke::new(1.5, color));
+        }
+    }
 }
 
 /// A small captioned cell: a label above its widget, grouped so the toolbar
