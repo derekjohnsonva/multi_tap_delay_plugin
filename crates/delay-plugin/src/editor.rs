@@ -391,11 +391,15 @@ fn paint_lane(ui: &egui::Ui, rect: egui::Rect, lane: &Lane, geom: &LaneGeom, vie
     // Guide line behind the taps.
     let overlay_pts: Vec<egui::Pos2> = match view.overlay {
         Overlay::SourceCurve => {
-            const CURVE_STEPS: usize = 96;
+            // Sample roughly once per horizontal pixel so a high-cycle shape
+            // renders smoothly. A fixed low step count would alias: too few
+            // points per cycle makes the polyline's peaks/troughs land at
+            // varying phases and look ragged, even though the taps are exact.
+            let steps = (geom.plot.width().round() as usize).clamp(64, 4096);
             let source = lane.source();
-            (0..=CURVE_STEPS)
+            (0..=steps)
                 .map(|s| {
-                    let t = s as f32 / CURVE_STEPS as f32;
+                    let t = s as f32 / steps as f32;
                     let v = source.value_at(t).clamp(geom.lo, 1.0);
                     egui::pos2(geom.plot.left() + t * geom.plot.width(), geom.y_of(v))
                 })
