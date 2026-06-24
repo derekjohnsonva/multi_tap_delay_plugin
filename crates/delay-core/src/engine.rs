@@ -146,6 +146,15 @@ impl Engine {
         self.taps.len()
     }
 
+    /// Pre-allocate capacity for `max_taps` so growing the tap set in
+    /// [`Engine::set_taps`] never allocates on the audio thread. Call once when
+    /// the host max tap count is known (e.g. from `initialize`).
+    pub fn reserve_taps(&mut self, max_taps: usize) {
+        if max_taps > self.taps.len() {
+            self.taps.reserve(max_taps - self.taps.len());
+        }
+    }
+
     /// Replace the tap set. Existing taps (by index) keep their smoother state
     /// so gain/pan ramp from where they were; appended taps fade in from gain 0;
     /// removed taps (indices past the new length) fade their gain to 0 before
@@ -364,6 +373,40 @@ mod tests {
         // Once faded, a later update garbage-collects the dead slot.
         eng.set_taps(&[Tap::new(1.0, 1.0, 0.0)]);
         assert_eq!(eng.num_taps(), 1, "faded-out tap is dropped");
+    }
+
+    #[test]
+    fn taps_beyond_buffer_do_not_pile_up() {
+        // Reproduce "bump taps to max": ramp the count up to 128 with a tap
+        // spacing large enough that most taps land beyond the buffer's max
+        // delay, then drive an impulse and run past that delay. The too-long
+        // taps must stay SILENT (read returns 0) rather than clamping onto the
+        // max-delay position and firing together as one loud stack.
+        let max_delay = 4_800;
+        let mut eng = Engine::new(SR, max_delay);
+        eng.reserve_taps(128);
+        eng.set_smoothing_ms(0.0); // settle instantly for a clean level check
+        eng.set_mix(1.0);
+        eng.set_output_trim(1.0);
+
+        let step = 1_000.0; // only taps 1..4 (≤4000) fit; 5..128 are too long
+        let taps: Vec<Tap> = (0..128)
+            .map(|i| Tap::new((i as f32 + 1.0) * step, 1.0, 0.0))
+            .collect();
+        eng.set_taps(&taps);
+
+        // Impulse then silence, run well past max_delay.
+        let mut max_abs: f32 = 0.0;
+        for n in 0..20_000 {
+            let x = if n < 1 { 1.0 } else { 0.0 };
+            let (l, r) = eng.process_sample(x, x);
+            assert!(l.is_finite() && r.is_finite(), "non-finite during playout");
+            max_abs = max_abs.max(l.abs()).max(r.abs());
+        }
+        // Only the ~4 in-buffer taps ever sound (each ≈0.707 at centre, never
+        // simultaneously), so the peak is ~1 — not the ~90-tap stack we'd get if
+        // out-of-range taps clamped onto the same read position.
+        assert!(max_abs < 2.0, "too-long taps piled up into a loud stack: {max_abs}");
     }
 
     #[test]

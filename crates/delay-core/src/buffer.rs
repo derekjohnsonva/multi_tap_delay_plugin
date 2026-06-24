@@ -52,13 +52,22 @@ impl DelayLine {
 
     /// Read the sample written `delay_samples` ago, linearly interpolated.
     ///
-    /// `delay_samples` is clamped to `[0, max_delay()]`. Reading before the
-    /// buffer has filled returns the zeros it was initialised with.
+    /// A delay **beyond** `max_delay()` returns silence (`0.0`): that sample is
+    /// older than the buffer can hold, so it genuinely isn't there. Clamping it
+    /// to the maximum instead would make every too-long tap pile up on the same
+    /// read position — a loud stack of simultaneous echoes. Negative delays read
+    /// the newest sample, and a non-finite delay (NaN/Inf) is treated as silence
+    /// rather than propagating into the output. Reads before the buffer has
+    /// filled return the zeros it was initialised with.
     #[inline]
     pub fn read(&self, delay_samples: f32) -> f32 {
         let len = self.buffer.len();
         let max = self.max_delay() as f32;
-        let delay = delay_samples.clamp(0.0, max);
+        // Too old to hold, or non-finite: silence (NaN must not propagate).
+        if delay_samples.is_nan() || delay_samples > max {
+            return 0.0;
+        }
+        let delay = delay_samples.max(0.0);
 
         let d_floor = delay.floor();
         let frac = delay - d_floor;
@@ -130,14 +139,37 @@ mod tests {
     }
 
     #[test]
-    fn delay_is_clamped_to_max() {
+    fn reads_beyond_max_are_silent() {
         let mut line = DelayLine::new(2);
         for v in [7.0, 8.0, 9.0] {
             line.write(v);
         }
-        // max_delay == 2; asking for more clamps rather than panicking.
-        let clamped = line.read(100.0);
-        approx(clamped, line.read(2.0));
+        // The oldest holdable sample still reads...
+        approx(line.read(2.0), 7.0);
+        // ...but anything older than the buffer is silence, NOT clamped onto the
+        // max-delay sample (which would pile up too-long taps into a loud stack).
+        approx(line.read(2.1), 0.0);
+        approx(line.read(100.0), 0.0);
+    }
+
+    #[test]
+    fn non_finite_delay_is_silent() {
+        let mut line = DelayLine::new(8);
+        for v in [1.0, 2.0, 3.0] {
+            line.write(v);
+        }
+        // A NaN/Inf delay must not propagate into the output.
+        approx(line.read(f32::NAN), 0.0);
+        approx(line.read(f32::INFINITY), 0.0);
+    }
+
+    #[test]
+    fn negative_delay_reads_newest() {
+        let mut line = DelayLine::new(8);
+        for v in [1.0, 2.0, 3.0] {
+            line.write(v);
+        }
+        approx(line.read(-5.0), 3.0);
     }
 
     #[test]
