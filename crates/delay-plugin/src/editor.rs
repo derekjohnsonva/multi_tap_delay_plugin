@@ -72,7 +72,7 @@ pub fn create(
                 // Amplitude lane (top): unipolar 0..1, or bipolar when polarity
                 // is on. The continuous source shape is traced behind the taps.
                 // Drag a tap to detach + set it; drag the background to nudge the
-                // amp amount; right-click a tap to relink it.
+                // amp amount; double-click (or right-click) a tap to relink it.
                 ui.add_space(2.0);
                 ui.label(egui::RichText::new("Amplitude").small().weak());
                 let bipolar = params.polarity.value();
@@ -271,7 +271,8 @@ impl LaneGeom {
 ///
 /// Interaction (design §7): **drag a tap** to detach + set its value; **drag the
 /// background curve** to nudge the source `amount` param, which moves every
-/// linked tap at once; **right-click a tap** to relink it to the source.
+/// linked tap at once; **double-click (or right-click) a tap** to relink it to
+/// the source so it snaps back onto the shape.
 fn lane_widget(
     ui: &mut egui::Ui,
     lock: &parking_lot::RwLock<Lane>,
@@ -412,8 +413,9 @@ fn handle_lane_input(
     let geom = LaneGeom::new(rect, view.bipolar, count);
     let drag_id = egui::Id::new(("lane_drag", view.id));
 
-    // Right-click a tap to relink it to the source.
-    if response.secondary_clicked() {
+    // Double-click (or right-click) a tap to relink it: it snaps back onto the
+    // source shape, re-sampling from the curve like an unedited tap.
+    if response.double_clicked() || response.secondary_clicked() {
         if let Some(px) = response.interact_pointer_pos() {
             if let Some((i, dist)) = geom.nearest_tap(px.x) {
                 if dist <= TAP_GRAB_PX {
