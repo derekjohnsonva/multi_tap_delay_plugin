@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: test + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # nih-plug's egui editor pulls in baseview, which needs X11/GL/ALSA headers.
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libasound2-dev libgl1-mesa-dev libx11-dev libx11-xcb-dev libxcb1-dev \
+            libxcb-icccm4-dev libxcb-dri2-0-dev libxcb-dri3-dev libxcb-render0-dev \
+            libxcursor-dev libxkbcommon-dev libxcb-shape0-dev libxcb-xfixes0-dev
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --workspace
+
+  clap-validator:
+    name: clap-validator
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libasound2-dev libgl1-mesa-dev libx11-dev libx11-xcb-dev libxcb1-dev \
+            libxcb-icccm4-dev libxcb-dri2-0-dev libxcb-dri3-dev libxcb-render0-dev \
+            libxcursor-dev libxkbcommon-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            xvfb
+      # Pin a rev for reproducibility; bump deliberately. Cached by rust-cache.
+      - name: Install clap-validator
+        run: cargo install --git https://github.com/free-audio/clap-validator.git --locked
+      - name: Bundle CLAP
+        run: cargo xtask bundle delay-plugin --release
+      # xvfb provides a display for the validator's GUI-creation tests.
+      - name: Validate CLAP
+        run: xvfb-run -a clap-validator validate target/bundled/delay-plugin.clap
