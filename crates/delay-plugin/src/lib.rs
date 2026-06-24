@@ -12,6 +12,7 @@ mod params;
 use delay_core::{Engine, Tap};
 use nih_plug::prelude::*;
 use params::{DelayParams, TimeMode, MAX_TAPS};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 /// Longest tap time the delay buffer can hold. Tap times past this clamp.
@@ -25,6 +26,9 @@ struct DelayPlugin {
     sample_rate: f32,
     /// Reused per-block tap buffer so `process()` never allocates.
     scratch: Vec<Tap>,
+    /// Last tempo seen by the audio thread, shared with the editor so it can
+    /// render sync-mode tap times in ms (e.g. the comb-zone hint, PR 17).
+    current_bpm: Arc<AtomicF32>,
 }
 
 impl Default for DelayPlugin {
@@ -36,6 +40,7 @@ impl Default for DelayPlugin {
             engine: Engine::new(44_100.0, 44_100),
             sample_rate: 44_100.0,
             scratch: Vec::with_capacity(MAX_TAPS as usize),
+            current_bpm: Arc::new(AtomicF32::new(FALLBACK_BPM)),
         }
     }
 }
@@ -124,7 +129,7 @@ impl Plugin for DelayPlugin {
     }
 
     fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
-        editor::create(self.params.clone())
+        editor::create(self.params.clone(), self.current_bpm.clone())
     }
 
     fn initialize(
@@ -153,6 +158,7 @@ impl Plugin for DelayPlugin {
     ) -> ProcessStatus {
         // Per-block config: rebuild taps and push the scalar params.
         let bpm = context.transport().tempo.unwrap_or(FALLBACK_BPM as f64) as f32;
+        self.current_bpm.store(bpm, Ordering::Relaxed);
         self.update_taps(bpm);
         self.engine.set_smoothing_ms(self.params.smoothing.value());
         self.engine.set_mix(self.params.mix.value());
