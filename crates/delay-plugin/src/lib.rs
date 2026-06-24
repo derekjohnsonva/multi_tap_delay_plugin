@@ -65,23 +65,8 @@ impl DelayPlugin {
     /// persisted lanes non-blockingly; if the editor holds the lock this block
     /// is skipped and the engine keeps smoothing toward its last targets.
     fn update_taps(&mut self, bpm: f32) {
-        let count = self.params.tap_count.value() as usize;
+        let count = self.params.active_tap_count();
         let step = self.step_samples(bpm);
-        let amp_source = self
-            .params
-            .amp_shape
-            .value()
-            .to_source(self.params.amp_amount.value());
-        let pan_source = delay_core::LaneSource::PingPong {
-            width: self.params.pingpong_amount.value(),
-            widen: 0.0,
-        };
-        // Polarity (PR 13) widens the amplitude lane to bipolar.
-        let amp_range = if self.params.polarity.value() {
-            (-1.0, 1.0)
-        } else {
-            (0.0, 1.0)
-        };
 
         let (Some(mut amp), Some(mut pan)) =
             (self.params.amp_lane.try_write(), self.params.pan_lane.try_write())
@@ -89,11 +74,9 @@ impl DelayPlugin {
             return;
         };
 
-        amp.set_range(amp_range.0, amp_range.1);
-        amp.set_source(amp_source);
-        amp.set_count(count);
-        pan.set_source(pan_source);
-        pan.set_count(count);
+        // Reconstruct each lane's derived source/range/count from the params
+        // (the lanes persist only their detach overrides), then sample them.
+        self.params.apply_to_lanes(&mut amp, &mut pan);
 
         self.scratch.clear();
         for i in 0..count {

@@ -51,10 +51,18 @@ pub fn create(
                 // The meter and lanes are level-driven; keep repainting so they
                 // animate even when no params change.
                 ctx.request_repaint();
-                // The audio thread keeps each lane's source/count/range in sync
-                // with the params every block, so reading them here yields the
-                // live per-tap gains/pans. A blocking read is fine: the audio
-                // thread only ever `try_write`s, so it never waits on the GUI.
+                // Reconstruct each lane's derived source/range/count from the
+                // params before reading them. These fields aren't persisted, so
+                // the editor must rebuild them itself rather than rely on the
+                // audio thread having processed a block — otherwise a project
+                // opened with the transport stopped would render stale lanes.
+                // The audio thread only `try_write`s, so this brief blocking
+                // write never makes it wait on the GUI.
+                {
+                    let mut amp = params.amp_lane.write();
+                    let mut pan = params.pan_lane.write();
+                    params.apply_to_lanes(&mut amp, &mut pan);
+                }
 
                 // Tap spacing and the comb-zone extent are the same for both
                 // lanes (one shared time axis). Compute them once: the fraction

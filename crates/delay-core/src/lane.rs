@@ -105,7 +105,18 @@ enum LinkState {
 /// discarded — `taps` is a high-water-mark store and `active` marks how many
 /// of them are currently live. Shrinking just lowers `active`; re-growing
 /// revives the retained taps with their stored edits intact.
+///
+/// **Persistence:** only the per-tap *detach overrides* are serialized (see
+/// [`LanePersist`]). A lane's `source`, clamp `range`, and `active` count are
+/// all derived from the plugin params, which are persisted separately, so
+/// round-tripping them here would be both redundant and a source of
+/// nondeterminism: they're only synced from the params inside `process()`, so a
+/// state saved on a param-flush (no audio processed) would differ from one saved
+/// after processing — exactly the `state-reproducibility-flush` failure that
+/// clap-validator catches. Persisting just the overrides makes the saved state a
+/// pure function of the authored edits.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(into = "LanePersist", from = "LanePersist")]
 pub struct Lane {
     source: LaneSource,
     /// Resolved values are clamped to this inclusive range.
@@ -113,6 +124,60 @@ pub struct Lane {
     max: f32,
     taps: Vec<LinkState>,
     active: usize,
+}
+
+/// The persisted form of a [`Lane`]: only the per-tap detach overrides, in
+/// ascending index order (so the serialization is deterministic). Everything
+/// else is reconstructed from the params at runtime via [`Lane::set_source`] /
+/// [`Lane::set_range`] / [`Lane::set_count`].
+#[derive(Serialize, Deserialize)]
+struct LanePersist {
+    /// `(tap index, override value)` for each detached tap.
+    overrides: Vec<(usize, f32)>,
+}
+
+impl From<Lane> for LanePersist {
+    fn from(lane: Lane) -> Self {
+        let overrides = lane
+            .taps
+            .iter()
+            .enumerate()
+            .filter_map(|(i, state)| match state {
+                LinkState::Detached(v) => Some((i, *v)),
+                LinkState::Linked => None,
+            })
+            .collect();
+        LanePersist { overrides }
+    }
+}
+
+impl From<LanePersist> for Lane {
+    fn from(persist: LanePersist) -> Self {
+        // Size the high-water-mark store to hold the highest override index; the
+        // gaps (and any taps beyond it) default to linked. The source/range and
+        // the active count are placeholders — the plugin overwrites them from
+        // the params before the lane is read (audio thread and editor both call
+        // through to `set_source`/`set_range`/`set_count`).
+        let len = persist
+            .overrides
+            .iter()
+            .map(|(i, _)| i + 1)
+            .max()
+            .unwrap_or(0);
+        let mut taps = vec![LinkState::Linked; len];
+        for (i, v) in persist.overrides {
+            if i < taps.len() {
+                taps[i] = LinkState::Detached(v);
+            }
+        }
+        Lane {
+            source: LaneSource::Constant(0.0),
+            min: 0.0,
+            max: 1.0,
+            taps,
+            active: len,
+        }
+    }
 }
 
 impl Lane {
@@ -364,17 +429,40 @@ mod tests {
     }
 
     #[test]
-    fn serde_round_trip_preserves_edits() {
+    fn serde_round_trip_preserves_detach_overrides() {
+        // Only the per-tap detach overrides persist; the source, range, and
+        // active count are derived from the plugin params at runtime, so they
+        // are intentionally NOT round-tripped here.
         let mut lane = Lane::new(LaneSource::ExpDecay { k: 2.0 }, (0.0, 1.0), 6);
         lane.set_tap_value(3, 0.123); // a detached edit
         lane.set_count(2); // shrink (retains the edit beyond active)
         let json = serde_json::to_string(&lane).unwrap();
         let restored: Lane = serde_json::from_str(&json).unwrap();
-        assert_eq!(restored.count(), 2);
-        // Re-growing the restored lane brings the persisted edit back.
+        // Re-apply a source/range/count, exactly as the plugin does from its
+        // params each block, and the persisted edit comes back at its index.
         let mut restored = restored;
+        restored.set_source(LaneSource::ExpDecay { k: 2.0 });
+        restored.set_range(0.0, 1.0);
         restored.set_count(6);
         approx(restored.value(3), 0.123);
+        assert!(!restored.is_linked(3));
+        // A linked tap follows the re-applied source — the override is what was
+        // carried across, not the Linked padding.
+        assert!(restored.is_linked(0));
+    }
+
+    #[test]
+    fn serialization_ignores_derived_fields() {
+        // The crux of the clap-validator `state-reproducibility-flush` fix: two
+        // lanes with the same (empty) overrides must serialize identically even
+        // when their derived source/range/active differ — otherwise a state
+        // saved after processing would not match one saved on a param flush.
+        let after_flush = Lane::new(LaneSource::ExpDecay { k: 3.0 }, (0.0, 1.0), 8);
+        let after_process = Lane::new(LaneSource::Triangle { cycles: 0.5 }, (-1.0, 1.0), 15);
+        assert_eq!(
+            serde_json::to_string(&after_flush).unwrap(),
+            serde_json::to_string(&after_process).unwrap(),
+        );
     }
 
     #[test]

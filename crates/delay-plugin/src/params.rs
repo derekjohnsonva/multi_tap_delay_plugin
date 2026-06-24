@@ -218,6 +218,51 @@ impl Default for DelayParams {
     }
 }
 
+impl DelayParams {
+    /// Active tap count as a `usize`.
+    pub fn active_tap_count(&self) -> usize {
+        self.tap_count.value() as usize
+    }
+
+    /// The amplitude lane's source for the current shape + amount params.
+    pub fn amp_source(&self) -> LaneSource {
+        self.amp_shape.value().to_source(self.amp_amount.value())
+    }
+
+    /// The pan lane's source — the ping-pong generator at the current width.
+    pub fn pan_source(&self) -> LaneSource {
+        LaneSource::PingPong {
+            width: self.pingpong_amount.value(),
+            widen: 0.0,
+        }
+    }
+
+    /// The amplitude lane's clamp range: bipolar when polarity is on (PR 13),
+    /// otherwise unipolar.
+    pub fn amp_range(&self) -> (f32, f32) {
+        if self.polarity.value() {
+            (-1.0, 1.0)
+        } else {
+            (0.0, 1.0)
+        }
+    }
+
+    /// Push the params-derived source/range/count into both lanes, leaving each
+    /// lane's per-tap detach overrides untouched. Called from both the audio
+    /// thread (`process`) and the editor so that neither depends on the other
+    /// having run — and so the lanes' derived fields, which are deliberately not
+    /// persisted, are always reconstructed from the params.
+    pub fn apply_to_lanes(&self, amp: &mut Lane, pan: &mut Lane) {
+        let count = self.active_tap_count();
+        let (lo, hi) = self.amp_range();
+        amp.set_range(lo, hi);
+        amp.set_source(self.amp_source());
+        amp.set_count(count);
+        pan.set_source(self.pan_source());
+        pan.set_count(count);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

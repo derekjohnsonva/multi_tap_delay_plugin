@@ -22,12 +22,17 @@ yay -S clap-validator              # stable AUR release (0.3.2)
 cargo install --git https://github.com/free-audio/clap-validator.git --locked
 ```
 
-## Current result: 21 tests — 15 passed, 5 skipped, **1 failed**
+## Result: 21 tests — **16 passed, 5 skipped, 0 failed** ✅
 
 - **5 skipped** are all note/MIDI-port tests — expected, we're an audio effect
   with no note ports.
-- **1 failure: `state-reproducibility-flush`.** This is a **real plugin bug**,
-  not a validator quirk.
+- The `state-reproducibility-flush` failure described below has been **fixed**
+  (see "The fix"); all three `state-reproducibility-*` tests now pass.
+
+## The bug that was found (and fixed)
+
+Originally `state-reproducibility-flush` **failed** — a real plugin bug, not a
+validator quirk.
 
 ### Root cause (confirmed by diffing the two state files)
 
@@ -53,14 +58,22 @@ The lane's `source`, `min`/`max`, and `active` are all **derived from params**
 both redundant and the source of this nondeterminism. The only genuinely
 user-authored lane state is the **per-tap detach overrides**.
 
-### Recommended fix (intersects the active lane/GUI work, so left for the owner)
+### The fix
 
-Make `process()` treat the persisted lanes as **read-only**: derive
-source/range/count locally and compute per-tap gain/pan without writing back
-into the `RwLock<Lane>`. Persist only the detach-override vector; reconstruct the
-derived fields from params on load. With no persisted state mutated in
-`process()`, the flush and process save paths produce identical state and the
-test passes.
+`Lane` now persists **only its per-tap detach overrides** (a sparse, ascending
+`Vec<(index, value)>`), via a `#[serde(into/from = "LanePersist")]` proxy. The
+`source`, clamp `range`, and `active` count are **derived from the params** —
+which persist separately — and are reconstructed at runtime by
+`DelayParams::apply_to_lanes`, called from **both**:
 
-(Not implemented on this branch because it touches the lane persistence model
-that PR 16–19 actively develop — surfacing it here for integration.)
+- the audio thread (`process` → `update_taps`, non-blocking `try_write`), and
+- the editor (a brief blocking `write` before it renders),
+
+so neither path depends on the other having run. With no derived/process-only
+state in the serialized form, the flush-path and process-path saves are
+byte-identical for identical params, and `state-reproducibility-flush` passes.
+
+Two `delay-core` unit tests pin this: `serde_round_trip_preserves_detach_overrides`
+(overrides survive; derived fields don't) and `serialization_ignores_derived_fields`
+(two lanes with different source/range/count but no overrides serialize
+identically — the exact regression).
