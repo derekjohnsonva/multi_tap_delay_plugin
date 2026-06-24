@@ -29,18 +29,52 @@ pub fn create(params: Arc<DelayParams>) -> Option<Box<dyn Editor>> {
             });
 
             egui::CentralPanel::default().show(ctx, |ui| {
+                // The audio thread keeps each lane's source/count/range in sync
+                // with the params every block, so reading them here yields the
+                // live per-tap gains/pans. A blocking read is fine: the audio
+                // thread only ever `try_write`s, so it never waits on the GUI.
+
+                // Split the remaining height into two equal lanes, reserving a
+                // band for the labels, spacing, and the future time axis note.
+                let lane_h = ((ui.available_height() - 96.0) * 0.5).clamp(70.0, 200.0);
+
+                // Amplitude lane (top): unipolar 0..1, or bipolar when polarity
+                // is on. The continuous source shape is traced behind the taps.
                 ui.add_space(2.0);
                 ui.label(egui::RichText::new("Amplitude").small().weak());
-                // The audio thread keeps `amp_lane`'s source/count/range in sync
-                // with the params each block, so reading it here yields the live
-                // per-tap gains. A blocking read is fine: the audio thread only
-                // ever `try_write`s, so it never waits on the GUI.
                 let bipolar = params.polarity.value();
-                draw_amp_lane(ui, &params.amp_lane.read(), bipolar);
+                draw_lane(
+                    ui,
+                    &params.amp_lane.read(),
+                    LaneView {
+                        height: lane_h,
+                        bipolar,
+                        overlay: Overlay::SourceCurve,
+                        top_label: if bipolar { "+" } else { "1" },
+                        bottom_label: if bipolar { "−" } else { "0" },
+                    },
+                );
+
+                // Pan lane (bottom): always bipolar, centre = 0, up = R / down =
+                // L. Ping-pong shows up as the alternating zig-zag connecting the
+                // tap tips.
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new("Pan").small().weak());
+                draw_lane(
+                    ui,
+                    &params.pan_lane.read(),
+                    LaneView {
+                        height: lane_h,
+                        bipolar: true,
+                        overlay: Overlay::ConnectTaps,
+                        top_label: "R",
+                        bottom_label: "L",
+                    },
+                );
 
                 ui.add_space(6.0);
                 ui.label(
-                    egui::RichText::new("Pan lane, time axis & meter — coming in PR 16–18")
+                    egui::RichText::new("Shared time axis & meter — coming in PR 17–18")
                         .weak()
                         .italics(),
                 );
@@ -98,18 +132,42 @@ fn toolbar(ui: &mut egui::Ui, params: &DelayParams, setter: &ParamSetter) {
     });
 }
 
-/// Draw the amplitude lane (design §7): the source curve traced as a smooth
-/// overlay, with each tap as a stem rising from the baseline to a lollipop at
-/// its resolved gain. Linked taps follow the curve and render in the accent
+/// How a lane traces a guide line behind its taps.
+#[derive(Clone, Copy)]
+enum Overlay {
+    /// Sample the source shape continuously across the lane (amplitude lane).
+    SourceCurve,
+    /// Connect the resolved tap tips, emphasising the discrete pattern — the
+    /// ping-pong zig-zag on the pan lane.
+    ConnectTaps,
+}
+
+/// Presentation options for a lane, so the one renderer serves both lanes.
+struct LaneView {
+    /// Height of the lane's drawing area in points.
+    height: f32,
+    /// Baseline in the middle (`-1..1`) rather than at the bottom (`0..1`).
+    bipolar: bool,
+    overlay: Overlay,
+    /// Tiny labels at the top and bottom-left of the plot (e.g. `R`/`L`).
+    top_label: &'static str,
+    bottom_label: &'static str,
+}
+
+/// Draw one parameter lane (design §7): a guide line traced behind each tap,
+/// every tap drawn as a stem rising from the baseline to a lollipop at its
+/// resolved value. Linked taps follow the source and render in the accent
 /// colour; detached taps (per-tap overrides) render as a distinct hollow marker
-/// so manual edits stand out. With polarity on the lane is bipolar (baseline in
-/// the middle, stems up for positive and down for negative gain); otherwise it
-/// is unipolar with the baseline at the bottom. Read-only here — PR 19 makes the
-/// taps and curve draggable.
-fn draw_amp_lane(ui: &mut egui::Ui, lane: &Lane, bipolar: bool) {
-    // Take all the width and a fixed slice of height; the rest of the central
-    // panel is reserved for the pan lane + meter (PR 16/18).
-    let height = (ui.available_height() - 28.0).clamp(80.0, 220.0);
+/// so manual edits stand out. Read-only here — PR 19 makes taps/curve draggable.
+fn draw_lane(ui: &mut egui::Ui, lane: &Lane, view: LaneView) {
+    let LaneView {
+        height,
+        bipolar,
+        overlay,
+        top_label,
+        bottom_label,
+    } = view;
+
     let (rect, _response) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), height), egui::Sense::hover());
     let painter = ui.painter_at(rect);
@@ -127,7 +185,7 @@ fn draw_amp_lane(ui: &mut egui::Ui, lane: &Lane, bipolar: bool) {
     let pad = 8.0;
     let plot = rect.shrink(pad);
     // Value 1.0 reaches the top; the baseline sits at the bottom (unipolar) or
-    // the vertical centre (bipolar). `max` is the full-scale value (always 1.0).
+    // the vertical centre (bipolar). Full-scale magnitude is always 1.0.
     let baseline_y = if bipolar { plot.center().y } else { plot.bottom() };
     let half = if bipolar { plot.height() * 0.5 } else { plot.height() };
     let value_to_y = |v: f32| baseline_y - v * half;
@@ -153,21 +211,48 @@ fn draw_amp_lane(ui: &mut egui::Ui, lane: &Lane, bipolar: bool) {
         egui::Stroke::new(1.0, visuals.weak_text_color()),
     );
 
+    // Edge labels (top + bottom-left of the plot).
+    let label_color = visuals.weak_text_color();
+    painter.text(
+        plot.left_top(),
+        egui::Align2::LEFT_TOP,
+        top_label,
+        egui::FontId::proportional(10.0),
+        label_color,
+    );
+    painter.text(
+        plot.left_bottom(),
+        egui::Align2::LEFT_BOTTOM,
+        bottom_label,
+        egui::FontId::proportional(10.0),
+        label_color,
+    );
+
     let accent = visuals.selection.bg_fill;
     let detached_color = egui::Color32::from_rgb(0xff, 0xae, 0x42); // warm amber
+    let overlay_color = accent.gamma_multiply(0.4);
 
-    // Source curve overlay, sampled continuously across the lane width.
-    const CURVE_STEPS: usize = 96;
-    let curve_color = accent.gamma_multiply(0.4);
-    let source = lane.source();
-    let curve: Vec<egui::Pos2> = (0..=CURVE_STEPS)
-        .map(|s| {
-            let t = s as f32 / CURVE_STEPS as f32;
-            let v = source.value_at(t).clamp(lo, 1.0);
-            egui::pos2(plot.left() + t * plot.width(), value_to_y(v))
-        })
-        .collect();
-    painter.add(egui::Shape::line(curve, egui::Stroke::new(1.5, curve_color)));
+    // Guide line behind the taps.
+    let overlay_pts: Vec<egui::Pos2> = match overlay {
+        Overlay::SourceCurve => {
+            const CURVE_STEPS: usize = 96;
+            let source = lane.source();
+            (0..=CURVE_STEPS)
+                .map(|s| {
+                    let t = s as f32 / CURVE_STEPS as f32;
+                    let v = source.value_at(t).clamp(lo, 1.0);
+                    egui::pos2(plot.left() + t * plot.width(), value_to_y(v))
+                })
+                .collect()
+        }
+        Overlay::ConnectTaps => (0..count)
+            .map(|i| egui::pos2(index_to_x(i), value_to_y(lane.value(i))))
+            .collect(),
+    };
+    painter.add(egui::Shape::line(
+        overlay_pts,
+        egui::Stroke::new(1.5, overlay_color),
+    ));
 
     // Stems + lollipops for each tap.
     for i in 0..count {
