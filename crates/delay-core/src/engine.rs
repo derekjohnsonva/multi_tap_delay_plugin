@@ -56,6 +56,20 @@ pub struct Engine {
     mix: OnePole,
     output_trim: OnePole,
     smoothing_ms: f32,
+    /// Decaying peak of the post-trim output (max across L/R), for the editor's
+    /// always-visible output meter (design §4/§7). Updated per sample; rises
+    /// instantly to a new peak and falls back by `meter_release` each sample.
+    meter_peak: f32,
+    meter_release: f32,
+}
+
+/// Time for the output meter's peak hold to decay by `1/e` (≈37%). A slowish
+/// release keeps transient peaks readable without latching.
+const METER_RELEASE_SECONDS: f32 = 0.3;
+
+/// Per-sample multiplier giving the [`METER_RELEASE_SECONDS`] decay at `sr`.
+fn meter_release_coeff(sample_rate: f32) -> f32 {
+    (-1.0 / (METER_RELEASE_SECONDS * sample_rate)).exp()
 }
 
 impl Engine {
@@ -74,6 +88,8 @@ impl Engine {
             mix,
             output_trim,
             smoothing_ms,
+            meter_peak: 0.0,
+            meter_release: meter_release_coeff(sample_rate),
         }
     }
 
@@ -81,10 +97,17 @@ impl Engine {
     pub fn reset(&mut self) {
         self.left.reset();
         self.right.reset();
+        self.meter_peak = 0.0;
         for t in &mut self.taps {
             t.gain.set_immediate(t.gain.value());
             t.pan.set_immediate(t.pan.value());
         }
+    }
+
+    /// Current decaying peak of the post-trim output (linear, max of L/R). The
+    /// editor reads this for the output meter; it's `0.0` until audio flows.
+    pub fn output_level(&self) -> f32 {
+        self.meter_peak
     }
 
     /// Set the per-coefficient smoothing time (ms) for gain, pan and mix.
@@ -181,6 +204,11 @@ impl Engine {
         let trim = self.output_trim.next();
         let out_l = (in_l * (1.0 - mix) + wet_l * mix) * trim;
         let out_r = (in_r * (1.0 - mix) + wet_r * mix) * trim;
+
+        // Peak-hold meter: jump up to a new peak, otherwise decay.
+        let peak = out_l.abs().max(out_r.abs());
+        self.meter_peak = peak.max(self.meter_peak * self.meter_release);
+
         (out_l, out_r)
     }
 
@@ -323,6 +351,31 @@ mod tests {
         // Once faded, a later update garbage-collects the dead slot.
         eng.set_taps(&[Tap::new(1.0, 1.0, 0.0)]);
         assert_eq!(eng.num_taps(), 1, "faded-out tap is dropped");
+    }
+
+    #[test]
+    fn output_meter_tracks_peak_then_decays() {
+        // One centered tap; drive a single impulse and confirm the meter rises
+        // to the output peak, holds it, then decays toward zero.
+        let mut eng = settled_engine(&[Tap::new(1.0, 1.0, 0.0)], 1.0);
+        assert_eq!(eng.output_level(), 0.0);
+
+        eng.process_sample(1.0, 1.0); // impulse in
+        let after_impulse = eng.process_sample(0.0, 0.0).0; // tap fires here
+        let peak = eng.output_level();
+        assert!(peak > 0.0, "meter should register the peak");
+        assert!((peak - after_impulse.abs()).abs() < 1e-6, "meter == |out|");
+
+        // With silence in, the peak holds then decays but never rises again.
+        // ~0.42 s at 48 kHz is well past the 0.3 s (1/e) release.
+        let mut prev = peak;
+        for _ in 0..20_000 {
+            let now = eng.output_level();
+            assert!(now <= prev + 1e-7, "meter must not rise without new signal");
+            prev = now;
+            eng.process_sample(0.0, 0.0);
+        }
+        assert!(prev < peak * 0.5, "meter should have decayed substantially");
     }
 
     #[test]

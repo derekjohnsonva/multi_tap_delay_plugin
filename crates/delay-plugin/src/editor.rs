@@ -20,7 +20,11 @@ use std::sync::Arc;
 const PLOT_PAD: f32 = 8.0;
 
 /// Build the editor. Returns `None` only if the host can't host an egui window.
-pub fn create(params: Arc<DelayParams>, current_bpm: Arc<AtomicF32>) -> Option<Box<dyn Editor>> {
+pub fn create(
+    params: Arc<DelayParams>,
+    current_bpm: Arc<AtomicF32>,
+    meter_level: Arc<AtomicF32>,
+) -> Option<Box<dyn Editor>> {
     let egui_state = params.editor_state.clone();
     create_egui_editor(
         egui_state,
@@ -33,7 +37,20 @@ pub fn create(params: Arc<DelayParams>, current_bpm: Arc<AtomicF32>) -> Option<B
                 ui.add_space(4.0);
             });
 
+            // Output meter pinned to the right edge, always visible (design §7).
+            egui::SidePanel::right("meter")
+                .resizable(false)
+                .exact_width(44.0)
+                .show(ctx, |ui| {
+                    ui.add_space(2.0);
+                    ui.label(egui::RichText::new("Out").small().weak());
+                    draw_meter(ui, meter_level.load(Ordering::Relaxed));
+                });
+
             egui::CentralPanel::default().show(ctx, |ui| {
+                // The meter and lanes are level-driven; keep repainting so they
+                // animate even when no params change.
+                ctx.request_repaint();
                 // The audio thread keeps each lane's source/count/range in sync
                 // with the params every block, so reading them here yields the
                 // live per-tap gains/pans. A blocking read is fine: the audio
@@ -92,13 +109,6 @@ pub fn create(params: Arc<DelayParams>, current_bpm: Arc<AtomicF32>) -> Option<B
                 // multiples (sync), with the comb zone shaded at short times.
                 ui.add_space(4.0);
                 draw_time_axis(ui, &params, step_ms, count, comb_frac);
-
-                ui.add_space(4.0);
-                ui.label(
-                    egui::RichText::new("Output meter — coming in PR 18")
-                        .weak()
-                        .italics(),
-                );
             });
         },
     )
@@ -420,6 +430,68 @@ fn draw_time_axis(
     }
 }
 
+/// Output meter dB range: the bottom and top of the vertical scale.
+const METER_MIN_DB: f32 = -60.0;
+const METER_MAX_DB: f32 = 6.0;
+
+/// Map a linear level to its 0..1 position on the meter's dB scale.
+fn meter_norm(level: f32) -> f32 {
+    let db = 20.0 * level.max(1e-6).log10();
+    ((db - METER_MIN_DB) / (METER_MAX_DB - METER_MIN_DB)).clamp(0.0, 1.0)
+}
+
+/// Draw the vertical output meter (design §4/§7): a level bar on a dB scale with
+/// an always-visible amber headroom/clip zone above 0 dBFS. `level` is the
+/// post-trim linear peak published by the engine.
+fn draw_meter(ui: &mut egui::Ui, level: f32) {
+    let bar_w = 14.0;
+    let (rect, _response) = ui.allocate_exact_size(
+        egui::vec2(bar_w, ui.available_height() - 6.0),
+        egui::Sense::hover(),
+    );
+    let painter = ui.painter_at(rect);
+    let visuals = ui.visuals();
+
+    // Track.
+    painter.rect_filled(rect, 2.0, visuals.extreme_bg_color);
+
+    let y_of = |norm: f32| rect.bottom() - norm * rect.height();
+    let zero_db_y = y_of(meter_norm(1.0)); // 0 dBFS line
+
+    let amber = egui::Color32::from_rgb(0xff, 0xae, 0x42);
+    let red = egui::Color32::from_rgb(0xe5, 0x48, 0x4a);
+    let green = egui::Color32::from_rgb(0x4c, 0xc2, 0x7a);
+
+    // Always-visible clip/headroom zone above 0 dBFS.
+    let zone = egui::Rect::from_min_max(rect.left_top(), egui::pos2(rect.right(), zero_db_y));
+    painter.rect_filled(zone, 0.0, amber.gamma_multiply(0.18));
+
+    // Level fill from the bottom up. Over 0 dBFS the fill goes red.
+    let norm = meter_norm(level);
+    if norm > 0.0 {
+        let fill = egui::Rect::from_min_max(egui::pos2(rect.left(), y_of(norm)), rect.right_bottom());
+        let over = level > 1.0;
+        painter.rect_filled(fill, 2.0, if over { red } else { green });
+    }
+
+    // 0 dBFS reference line.
+    painter.line_segment(
+        [
+            egui::pos2(rect.left(), zero_db_y),
+            egui::pos2(rect.right(), zero_db_y),
+        ],
+        egui::Stroke::new(1.0, amber),
+    );
+
+    // Frame.
+    painter.rect_stroke(
+        rect,
+        2.0,
+        egui::Stroke::new(1.0, visuals.widgets.noninteractive.bg_stroke.color),
+        egui::StrokeKind::Inside,
+    );
+}
+
 /// A small captioned cell: a label above its widget, grouped so the toolbar
 /// reads as discrete controls rather than a run of sliders.
 fn labeled(ui: &mut egui::Ui, caption: &str, add_contents: impl FnOnce(&mut egui::Ui)) {
@@ -467,5 +539,15 @@ mod tests {
     fn degenerate_inputs_are_safe() {
         assert_eq!(comb_fraction(0.0, 8), 0.0);
         assert_eq!(comb_fraction(10.0, 0), 0.0);
+    }
+
+    #[test]
+    fn meter_norm_maps_db_scale() {
+        // Silence sits at the bottom, 0 dBFS near the top, clipping pinned to 1.
+        assert_eq!(meter_norm(0.0), 0.0);
+        approx(meter_norm(1.0), (0.0 - METER_MIN_DB) / (METER_MAX_DB - METER_MIN_DB));
+        assert_eq!(meter_norm(10.0), 1.0); // +20 dB clamps to the top
+        // Monotonic: louder reads higher.
+        assert!(meter_norm(0.5) > meter_norm(0.1));
     }
 }

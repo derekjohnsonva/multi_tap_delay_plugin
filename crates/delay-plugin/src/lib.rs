@@ -29,6 +29,9 @@ struct DelayPlugin {
     /// Last tempo seen by the audio thread, shared with the editor so it can
     /// render sync-mode tap times in ms (e.g. the comb-zone hint, PR 17).
     current_bpm: Arc<AtomicF32>,
+    /// Post-trim output level (linear peak), published for the editor's output
+    /// meter (PR 18).
+    meter_level: Arc<AtomicF32>,
 }
 
 impl Default for DelayPlugin {
@@ -41,6 +44,7 @@ impl Default for DelayPlugin {
             sample_rate: 44_100.0,
             scratch: Vec::with_capacity(MAX_TAPS as usize),
             current_bpm: Arc::new(AtomicF32::new(FALLBACK_BPM)),
+            meter_level: Arc::new(AtomicF32::new(0.0)),
         }
     }
 }
@@ -129,7 +133,11 @@ impl Plugin for DelayPlugin {
     }
 
     fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
-        editor::create(self.params.clone(), self.current_bpm.clone())
+        editor::create(
+            self.params.clone(),
+            self.current_bpm.clone(),
+            self.meter_level.clone(),
+        )
     }
 
     fn initialize(
@@ -177,6 +185,10 @@ impl Plugin for DelayPlugin {
                 *sample = l;
             }
         }
+
+        // Publish the post-trim output level for the editor's meter.
+        self.meter_level
+            .store(self.engine.output_level(), Ordering::Relaxed);
 
         ProcessStatus::Normal
     }
