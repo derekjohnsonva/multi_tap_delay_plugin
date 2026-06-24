@@ -1,9 +1,14 @@
 //! PR 3/4/6 — The multi-tap engine.
 //!
-//! One stereo delay buffer, N read taps. Each tap reads at a fractional delay,
-//! is collapsed to mono, scaled by a (smoothed) gain, and equal-power panned
-//! into the stereo field. The summed wet signal is crossfaded against the dry
-//! input by `mix` and scaled by `output_trim` (design doc §4).
+//! One **mono** delay buffer, N read taps. The stereo input is summed to mono
+//! on the way in (taps are mono sources by design), so a single delay line and
+//! a single fractional read per tap suffice — half the reads and half the
+//! memory of keeping separate L/R lines, with identical output because linear
+//! interpolation is linear: `0.5·(L.read + R.read) == read(0.5·(L + R))`. Each
+//! tap reads at a fractional delay, is scaled by a (smoothed) gain, and
+//! equal-power panned into the stereo field. The summed wet signal is
+//! crossfaded against the dry input by `mix` and scaled by `output_trim`
+//! (design doc §4).
 //!
 //! No feedback ⇒ unconditionally stable ⇒ arbitrary per-tap gains are safe.
 
@@ -45,14 +50,27 @@ struct TapState {
     /// A removed tap that is fading its gain to zero before being dropped, so
     /// the tap-count decrease doesn't click (design §3).
     dying: bool,
+    /// Cached equal-power gains and the pan value they were computed for.
+    /// `equal_power` calls `sin`+`cos`, by far the priciest per-tap op; pan is
+    /// almost always settled (constant), so we recompute the gains only when the
+    /// smoothed pan moves past [`PAN_EPS`] and reuse them otherwise. Seeded from
+    /// the tap's initial pan at construction so the first sample is already warm.
+    cached_pan: f32,
+    gl: f32,
+    gr: f32,
 }
+
+/// Largest pan change that reuses the cached equal-power gains. The gain error
+/// from skipping a recompute is bounded by ~`(π/4)·PAN_EPS ≈ 8e-5` (−82 dB),
+/// inaudible, while letting a settled pan stop calling trig entirely.
+const PAN_EPS: f32 = 1e-4;
 
 /// The multi-tap delay engine. Allocate once with [`Engine::new`]; all
 /// per-sample work is allocation-free.
 pub struct Engine {
     sample_rate: f32,
-    left: DelayLine,
-    right: DelayLine,
+    /// Mono delay line (stereo input summed on write). Taps read this once each.
+    delay: DelayLine,
     taps: Vec<TapState>,
     mix: OnePole,
     output_trim: OnePole,
@@ -84,8 +102,7 @@ impl Engine {
         output_trim.set_time(smoothing_ms, sample_rate);
         Self {
             sample_rate,
-            left: DelayLine::new(max_delay_samples),
-            right: DelayLine::new(max_delay_samples),
+            delay: DelayLine::new(max_delay_samples),
             taps: Vec::new(),
             mix,
             output_trim,
@@ -98,8 +115,7 @@ impl Engine {
 
     /// Clear all audio state (buffers + smoother positions snap to target).
     pub fn reset(&mut self) {
-        self.left.reset();
-        self.right.reset();
+        self.delay.reset();
         self.limiter.reset();
         self.meter_peak = 0.0;
         for t in &mut self.taps {
@@ -182,11 +198,15 @@ impl Engine {
                 gain.set_time(self.smoothing_ms, self.sample_rate);
                 pan.set_time(self.smoothing_ms, self.sample_rate);
                 gain.set_target(tap.gain);
+                let (gl, gr) = equal_power(tap.pan); // seed the pan-gain cache
                 self.taps.push(TapState {
                     delay_samples: tap.delay_samples,
                     gain,
                     pan,
                     dying: false,
+                    cached_pan: tap.pan,
+                    gl,
+                    gr,
                 });
             }
         }
@@ -201,21 +221,26 @@ impl Engine {
     /// Process one stereo frame, returning the mixed `(left, right)` output.
     #[inline]
     pub fn process_sample(&mut self, in_l: f32, in_r: f32) -> (f32, f32) {
-        self.left.write(in_l);
-        self.right.write(in_r);
+        // Sum to mono on the way in: taps are mono sources, so one line and one
+        // read per tap give the same result as reading separate L/R lines.
+        self.delay.write(0.5 * (in_l + in_r));
 
         let mut wet_l = 0.0;
         let mut wet_r = 0.0;
         for tap in &mut self.taps {
             let gain = tap.gain.next();
             let pan = tap.pan.next();
-            // Collapse the tap's stereo read to mono, then position it. This
-            // makes pan a true position (needed for crisp ping-pong) rather
-            // than a balance that merely attenuates one side.
-            let src = 0.5 * (self.left.read(tap.delay_samples) + self.right.read(tap.delay_samples));
-            let (lg, rg) = equal_power(pan);
-            wet_l += src * gain * lg;
-            wet_r += src * gain * rg;
+            // Recompute the equal-power gains only when the (smoothed) pan moves;
+            // a settled pan reuses the cache and pays no trig.
+            if (pan - tap.cached_pan).abs() > PAN_EPS {
+                let (lg, rg) = equal_power(pan);
+                tap.gl = lg;
+                tap.gr = rg;
+                tap.cached_pan = pan;
+            }
+            let src = self.delay.read(tap.delay_samples);
+            wet_l += src * gain * tap.gl;
+            wet_r += src * gain * tap.gr;
         }
 
         // Optional safety limiter on the summed wet signal (before the dry mix,
@@ -455,6 +480,34 @@ mod tests {
             eng.process_sample(0.0, 0.0);
         }
         assert!(prev < peak * 0.5, "meter should have decayed substantially");
+    }
+
+    #[test]
+    fn wet_path_depends_only_on_mono_sum() {
+        // The engine sums input to mono before the taps, so asymmetric stereo
+        // (a, b) must yield exactly the same wet output as feeding the mono sum
+        // ((a+b)/2, (a+b)/2) on both channels. Use mix=1.0 (wet only) so the dry
+        // path doesn't mask the comparison; a panned tap exercises both outputs.
+        let taps = [Tap::new(7.0, 0.8, 0.3), Tap::new(13.0, 0.5, -0.6)];
+        let mut asym = settled_engine(&taps, 1.0);
+        let mut mono = settled_engine(&taps, 1.0);
+
+        let input: [(f32, f32); 6] = [
+            (1.0, 0.0),
+            (0.2, -0.7),
+            (-0.5, 0.9),
+            (0.0, 0.0),
+            (0.33, 0.33),
+            (-0.8, -0.1),
+        ];
+        let mut max_diff: f32 = 0.0;
+        for &(a, b) in input.iter().cycle().take(400) {
+            let m = 0.5 * (a + b);
+            let (al, ar) = asym.process_sample(a, b);
+            let (ml, mr) = mono.process_sample(m, m);
+            max_diff = max_diff.max((al - ml).abs()).max((ar - mr).abs());
+        }
+        assert!(max_diff < 1e-6, "mono-collapse not equivalent: {max_diff}");
     }
 
     #[test]
