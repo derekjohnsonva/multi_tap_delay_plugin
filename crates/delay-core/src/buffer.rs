@@ -71,14 +71,15 @@ impl DelayLine {
 
         let d_floor = delay.floor();
         let frac = delay - d_floor;
-        let i0 = d_floor as usize; // newer neighbour
-        let i1 = i0 + 1; // older neighbour
+        let i0 = d_floor as usize; // newer neighbour (older is one slot behind)
 
         // Most recent sample sits at write_pos - 1; walk backwards from there.
-        // Bias by 2*len so the subtraction never underflows usize (i1 <= len-1).
+        // Bias by 2*len so the subtraction never underflows usize.
         let base = self.write_pos + 2 * len - 1;
-        let idx0 = (base - i0) % len;
-        let idx1 = (base - i1) % len;
+        let idx0 = (base - i0) % len; // newer neighbour
+        // The older neighbour is exactly one slot behind idx0 (i1 == i0 + 1), so
+        // derive it with a single branch instead of a second (costly) modulo.
+        let idx1 = if idx0 == 0 { len - 1 } else { idx0 - 1 };
 
         let s0 = self.buffer[idx0];
         let s1 = self.buffer[idx1];
