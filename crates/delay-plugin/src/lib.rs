@@ -15,8 +15,11 @@ use params::{DelayParams, TimeMode, MAX_TAPS};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-/// Longest tap time the delay buffer can hold. Tap times past this clamp.
-const MAX_DELAY_SECONDS: f32 = 10.0;
+/// Longest tap time the delay buffer can hold; taps scheduled past this go
+/// silent (they can't be stored). Generous enough that high tap counts at
+/// musical tempos are usable — 30 s holds, e.g., 128 × 1/16 at 120 BPM. At
+/// 48 kHz stereo this is ~11.5 MB. Tunable: larger costs proportional memory.
+const MAX_DELAY_SECONDS: f32 = 30.0;
 /// BPM used when the host reports no tempo (standalone / stopped transport).
 const FALLBACK_BPM: f32 = 120.0;
 
@@ -150,7 +153,10 @@ impl Plugin for DelayPlugin {
         let max_delay = (self.sample_rate * MAX_DELAY_SECONDS).ceil() as usize;
         self.engine = Engine::new(self.sample_rate, max_delay);
         self.engine.set_smoothing_ms(self.params.smoothing.value());
+        // Pre-allocate so neither the scratch nor the engine's tap set allocates
+        // on the audio thread when the tap count is ramped up to the max.
         self.scratch.reserve(MAX_TAPS as usize);
+        self.engine.reserve_taps(MAX_TAPS as usize);
         true
     }
 
