@@ -30,6 +30,48 @@ cargo clippy --all-targets
 cargo fmt
 ```
 
+## Profiling & benchmarking
+
+The DSP hot path lives in `delay-core`, so it can be measured directly — no DAW or plugin host needed. The cost is dominated by the per-tap inner loop, so the worst case is **maxed-out taps** (128); that's the configuration to profile.
+
+### Throughput benchmark
+
+`delay-core` ships a benchmark example that reports the real-time factor (×RT — how many seconds of audio it processes per second of wall-clock; higher is faster):
+
+```bash
+cargo run --release --example bench -p delay-core
+```
+
+It prints a table for 16/64/128 taps at 48 kHz. Use this for a quick before/after when changing the engine. Pass `<taps> [seconds]` to run a single config for longer (the form the flamegraph below points at):
+
+```bash
+cargo run --release --example bench -p delay-core -- 128 60   # 128 taps, 60 s of audio
+```
+
+### Flamegraph at max taps
+
+[`cargo-flamegraph`](https://github.com/flamegraph-rs/flamegraph) turns a profiled run into a flamegraph SVG, showing where the per-sample time actually goes.
+
+```bash
+cargo install flamegraph        # provides `cargo flamegraph`
+sudo pacman -S perf             # Linux backend (Arch); needs the kernel perf events
+```
+
+On Linux, `perf` is gated by `kernel.perf_event_paranoid`. Either lower it for the session, or let cargo-flamegraph elevate with `--root`:
+
+```bash
+sudo sysctl -w kernel.perf_event_paranoid=1
+```
+
+Profile the **max-taps** hot path. Building release with debug info (`CARGO_PROFILE_RELEASE_DEBUG=true`) keeps function names in the graph, and a longer run (60 s of audio) gives perf more samples to attribute:
+
+```bash
+CARGO_PROFILE_RELEASE_DEBUG=true \
+  cargo flamegraph --example bench --package delay-core -- 128 60
+```
+
+This writes `flamegraph.svg` to the repo root — open it in a browser and click frames to zoom. Look for the widest frames under `Engine::process` / `process_sample`: the fractional `DelayLine::read` and the equal-power pan gains are the usual hot spots, so a regression there shows up as a wider stack. (Note: the release profile uses thin LTO and `opt-level = 3`, so small functions are inlined into the loop — expect a few wide frames rather than a deep tree.)
+
 ## Bundling the plugin (CLAP / VST3)
 
 The `xtask` crate runs nih-plug's bundler. `cargo xtask` is aliased in `.cargo/config.toml`, so:
@@ -95,6 +137,8 @@ pluginval --strictness-level 10 --validate target/bundled/delay-plugin.vst3
 | Build everything (debug) | `cargo build` |
 | Run tests | `cargo test` |
 | Lint / format | `cargo clippy --all-targets` / `cargo fmt` |
+| Benchmark the engine (×RT) | `cargo run --release --example bench -p delay-core` |
+| Flamegraph at max taps | `CARGO_PROFILE_RELEASE_DEBUG=true cargo flamegraph --example bench --package delay-core -- 128 60` |
 | Bundle CLAP + VST3 (host) | `cargo xtask bundle delay-plugin --release` |
 | Build & install for Bitwig Flatpak | `scripts/bundle-flatpak.sh` |
 | Validate CLAP | `scripts/validate-clap.sh` |

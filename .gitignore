@@ -3,3 +3,8 @@
 Cargo.lock
 *.clap
 *.vst3
+
+# Profiling artifacts (see the README "Profiling & benchmarking" section)
+flamegraph.svg
+perf.data
+perf.data.old
