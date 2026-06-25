@@ -26,6 +26,8 @@ const PLOT_PAD: f32 = 8.0;
 const ACCENT: egui::Color32 = egui::Color32::from_rgb(0x4d, 0xa6, 0xff);
 /// Detached / manually-edited taps.
 const DETACHED: egui::Color32 = egui::Color32::from_rgb(0xff, 0xae, 0x42);
+/// Taps that won't play (delay past the buffer) — greyed out.
+const MUTED: egui::Color32 = egui::Color32::from_rgb(0x60, 0x66, 0x6f);
 /// Window / panel background.
 const BG: egui::Color32 = egui::Color32::from_rgb(0x17, 0x1a, 0x1f);
 /// Recessed lane-track / meter background.
@@ -104,6 +106,9 @@ pub fn create(
                 let bpm = current_bpm.load(Ordering::Relaxed);
                 let step_ms = step_ms(&params, bpm);
                 let comb_frac = comb_fraction(step_ms, count);
+                // How many taps fit in the delay buffer; the rest are scheduled
+                // past it and won't play, so the lanes grey them out.
+                let playable = playable_taps(step_ms, count, crate::MAX_DELAY_SECONDS * 1000.0);
 
                 // Split the remaining height into two equal lanes, reserving a
                 // band for the labels, spacing, and the time axis below.
@@ -129,6 +134,7 @@ pub fn create(
                         top_label: if bipolar { "+" } else { "1" },
                         bottom_label: if bipolar { "−" } else { "0" },
                         comb_frac,
+                        playable,
                     },
                 );
 
@@ -150,13 +156,14 @@ pub fn create(
                         top_label: "R",
                         bottom_label: "L",
                         comb_frac,
+                        playable,
                     },
                 );
 
                 // Shared time axis: tick labels in ms (free) or division
                 // multiples (sync), with the comb zone shaded at short times.
                 ui.add_space(4.0);
-                draw_time_axis(ui, &params, step_ms, count, comb_frac);
+                draw_time_axis(ui, &params, step_ms, count, comb_frac, playable);
             });
         },
     )
@@ -285,6 +292,10 @@ struct LaneView {
     /// Fraction of the plot width (from the left) whose tap delays fall in the
     /// comb zone; shaded as a hint. `0.0` draws nothing.
     comb_frac: f32,
+    /// Number of taps that fit in the delay buffer; taps at index `>= playable`
+    /// are scheduled past it and won't play, so they render greyed under a
+    /// "won't play" zone.
+    playable: usize,
 }
 
 /// Pointer must be within this many points of a tap (in x) to grab it rather
@@ -403,6 +414,12 @@ fn paint_lane(ui: &egui::Ui, rect: egui::Rect, lane: &Lane, geom: &LaneGeom, vie
     // Comb-zone hint: shade the short-time region behind everything else.
     shade_comb_zone(&painter, geom.plot, view.comb_frac);
 
+    // "Won't play" hint: taps scheduled past the buffer length are greyed under
+    // a shaded zone with a cutoff line.
+    if let Some(cx) = cutoff_x(geom, view.playable) {
+        shade_out_of_range(&painter, geom.plot, cx);
+    }
+
     let count = geom.count;
 
     // Baseline.
@@ -465,9 +482,17 @@ fn paint_lane(ui: &egui::Ui, rect: egui::Rect, lane: &Lane, geom: &LaneGeom, vie
     for i in 0..count {
         let tip = egui::pos2(geom.x_of(i), geom.y_of(lane.value(i)));
         let base = egui::pos2(geom.x_of(i), geom.baseline_y);
+
+        // Past the buffer: this tap is silent. Grey it out (the link/detach
+        // distinction no longer matters since it won't be heard).
+        if i >= view.playable {
+            painter.line_segment([base, tip], egui::Stroke::new(1.0, MUTED));
+            painter.circle_filled(tip, 3.0, MUTED);
+            continue;
+        }
+
         let linked = lane.is_linked(i);
         let color = if linked { accent } else { detached_color };
-
         painter.line_segment([base, tip], egui::Stroke::new(1.5, color));
         if linked {
             painter.circle_filled(tip, 3.5, color);
@@ -606,6 +631,45 @@ fn shade_comb_zone(painter: &egui::Painter, plot: egui::Rect, frac: f32) {
     painter.rect_filled(zone, 0.0, egui::Color32::from_rgba_unmultiplied(0xff, 0x6a, 0x3d, 18));
 }
 
+/// Number of taps that fit in a `max_delay_ms` buffer. Tap `i` (0-based) lands
+/// at delay `(i+1)·step_ms`, so the count that fit is `floor(max/step)`, capped
+/// at `count`. A non-positive step means no cutoff (all taps fit).
+fn playable_taps(step_ms: f32, count: usize, max_delay_ms: f32) -> usize {
+    if step_ms <= 0.0 {
+        return count;
+    }
+    ((max_delay_ms / step_ms).floor() as usize).min(count)
+}
+
+/// X of the cutoff between the last playable tap and the first one that's past
+/// the buffer, or `None` when every tap plays. Sits midway between the two taps.
+fn cutoff_x(geom: &LaneGeom, playable: usize) -> Option<f32> {
+    if playable >= geom.count {
+        return None;
+    }
+    Some(if playable == 0 {
+        geom.plot.left()
+    } else {
+        (geom.x_of(playable - 1) + geom.x_of(playable)) * 0.5
+    })
+}
+
+/// Shade the "won't play" region of `plot` (right of `cutoff_x`) and draw a
+/// dashed cutoff line, marking taps whose delay exceeds the buffer.
+fn shade_out_of_range(painter: &egui::Painter, plot: egui::Rect, cutoff_x: f32) {
+    let zone = egui::Rect::from_min_max(egui::pos2(cutoff_x, plot.top()), plot.right_bottom());
+    painter.rect_filled(zone, 0.0, egui::Color32::from_rgba_unmultiplied(0x9a, 0xa0, 0xaa, 20));
+    painter.extend(egui::Shape::dashed_line(
+        &[
+            egui::pos2(cutoff_x, plot.top()),
+            egui::pos2(cutoff_x, plot.bottom()),
+        ],
+        egui::Stroke::new(1.0, MUTED),
+        4.0,
+        3.0,
+    ));
+}
+
 /// The shared time axis below both lanes (design §7): tick labels in ms (free
 /// mode) or in division multiples (sync mode), aligned with the tap x-positions,
 /// with the comb zone shaded at short times to match the lanes above.
@@ -615,6 +679,7 @@ fn draw_time_axis(
     step_ms: f32,
     count: usize,
     comb_frac: f32,
+    playable: usize,
 ) {
     let (rect, _response) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), 22.0), egui::Sense::hover());
@@ -624,6 +689,13 @@ fn draw_time_axis(
     let plot = rect.shrink2(egui::vec2(PLOT_PAD, 0.0));
 
     shade_comb_zone(&painter, plot, comb_frac);
+
+    // Cutoff matching the lanes: a LaneGeom over this rect shares the same x
+    // mapping (it only differs vertically, which we don't use here).
+    let cutoff = cutoff_x(&LaneGeom::new(rect, false, count), playable);
+    if let Some(cx) = cutoff {
+        shade_out_of_range(&painter, plot, cx);
+    }
 
     let axis_color = visuals.weak_text_color();
     // Axis line along the top edge (just under the pan lane).
@@ -683,6 +755,17 @@ fn draw_time_axis(
             label,
             font.clone(),
             axis_color,
+        );
+    }
+
+    // Mark the buffer cutoff so the greyed taps above have an explanation.
+    if let Some(cx) = cutoff {
+        painter.text(
+            egui::pos2(cx + 3.0, rect.bottom()),
+            egui::Align2::LEFT_BOTTOM,
+            "max",
+            egui::FontId::proportional(9.0),
+            MUTED,
         );
     }
 }
@@ -811,6 +894,30 @@ mod tests {
     fn degenerate_inputs_are_safe() {
         assert_eq!(comb_fraction(0.0, 8), 0.0);
         assert_eq!(comb_fraction(10.0, 0), 0.0);
+    }
+
+    #[test]
+    fn playable_taps_counts_what_fits_in_the_buffer() {
+        // 1000 ms buffer, 250 ms spacing -> taps at 250,500,750,1000 fit (4);
+        // a 5th at 1250 ms does not.
+        assert_eq!(playable_taps(250.0, 8, 1000.0), 4);
+        // Everything fits.
+        assert_eq!(playable_taps(100.0, 8, 1000.0), 8);
+        // Nothing fits past the very first overflow (spacing > buffer).
+        assert_eq!(playable_taps(2000.0, 8, 1000.0), 0);
+        // Non-positive step -> no cutoff.
+        assert_eq!(playable_taps(0.0, 8, 1000.0), 8);
+    }
+
+    #[test]
+    fn cutoff_x_is_none_when_all_taps_play() {
+        let g = LaneGeom::new(rect_100(), false, 8);
+        assert!(cutoff_x(&g, 8).is_none());
+        assert!(cutoff_x(&g, 9).is_none());
+        // With some taps out of range, the cutoff sits between the last playable
+        // and first silent tap.
+        let cx = cutoff_x(&g, 4).unwrap();
+        assert!(cx > g.x_of(3) && cx < g.x_of(4));
     }
 
     fn rect_100() -> egui::Rect {
