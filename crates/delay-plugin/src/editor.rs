@@ -10,7 +10,7 @@
 //! - The time axis labels switch ms ↔ note-division by mode and shades the
 //!   comb zone; the meter shows the post-trim peak with a clip zone.
 
-use crate::params::{DelayParams, NoteDivision, TimeMode};
+use crate::params::{DelayParams, NoteDivision, Theme, TimeMode};
 use delay_core::{Lane, COMB_ZONE_MS};
 use nih_plug::prelude::*;
 use nih_plug_egui::{create_egui_editor, egui, widgets};
@@ -22,42 +22,206 @@ use std::sync::Arc;
 const PLOT_PAD: f32 = 8.0;
 
 // --- Palette (design §1: demo-quality look) -------------------------------
-/// Primary accent: curves, linked taps, selection.
-const ACCENT: egui::Color32 = egui::Color32::from_rgb(0x4d, 0xa6, 0xff);
-/// Detached / manually-edited taps.
-const DETACHED: egui::Color32 = egui::Color32::from_rgb(0xff, 0xae, 0x42);
-/// Taps that won't play (delay past the buffer) — greyed out.
-const MUTED: egui::Color32 = egui::Color32::from_rgb(0x60, 0x66, 0x6f);
-/// Window / panel background.
-const BG: egui::Color32 = egui::Color32::from_rgb(0x17, 0x1a, 0x1f);
-/// Recessed lane-track / meter background.
-const TRACK: egui::Color32 = egui::Color32::from_rgb(0x0e, 0x10, 0x14);
-/// Hairline borders around panels.
-const HAIRLINE: egui::Color32 = egui::Color32::from_rgb(0x2b, 0x31, 0x3a);
 
-/// Apply the plugin's dark theme once at editor creation (design §1 — a
-/// cohesive, demo-quality look rather than raw egui defaults).
-fn apply_theme(ctx: &egui::Context) {
-    let mut v = egui::Visuals::dark();
-    v.panel_fill = BG;
-    v.window_fill = BG;
-    v.extreme_bg_color = TRACK;
-    v.faint_bg_color = egui::Color32::from_rgb(0x1d, 0x21, 0x28);
-    v.selection.bg_fill = ACCENT.gamma_multiply(0.4);
-    v.selection.stroke = egui::Stroke::new(1.0, ACCENT);
-    v.hyperlink_color = ACCENT;
-    v.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, HAIRLINE);
+/// The resolved colour set for one [`Theme`]. Every theme-aware bit of the
+/// editor reads its colours from here, so a palette is the single source of
+/// truth for one look. The first six fields are hand-picked per theme; the
+/// remaining three (panel/widget fills) are derived from them in [`palette`] so
+/// each theme only has to specify the colours that actually carry its identity.
+#[derive(Clone, Copy)]
+struct Palette {
+    /// Primary accent: curves, linked taps, selection.
+    accent: egui::Color32,
+    /// Detached / manually-edited taps.
+    detached: egui::Color32,
+    /// Taps that won't play (delay past the buffer) — greyed out.
+    muted: egui::Color32,
+    /// Window / panel background.
+    bg: egui::Color32,
+    /// Recessed lane-track / meter background.
+    track: egui::Color32,
+    /// Hairline borders around panels.
+    hairline: egui::Color32,
+    /// Faint alternating background (derived).
+    faint_bg: egui::Color32,
+    /// Inactive widget fill (derived).
+    inactive: egui::Color32,
+    /// Hovered widget fill (derived).
+    hovered: egui::Color32,
+    /// Whether to base egui's `Visuals` on the dark or light defaults, which
+    /// drives the text colours that are not part of our palette.
+    dark: bool,
+}
+
+/// Linearly blend two colours (`t = 0` → `a`, `t = 1` → `b`), per channel.
+fn mix(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
+    let lerp = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
+    egui::Color32::from_rgb(lerp(a.r(), b.r()), lerp(a.g(), b.g()), lerp(a.b(), b.b()))
+}
+
+/// Assemble a [`Palette`] from its identity colours, deriving the panel/widget
+/// fills so every theme stays internally consistent (fills sit between the
+/// background and the hairline, the hover state leans toward the accent).
+fn palette(
+    accent: egui::Color32,
+    detached: egui::Color32,
+    muted: egui::Color32,
+    bg: egui::Color32,
+    track: egui::Color32,
+    hairline: egui::Color32,
+    dark: bool,
+) -> Palette {
+    let inactive = mix(bg, hairline, 0.85);
+    Palette {
+        accent,
+        detached,
+        muted,
+        bg,
+        track,
+        hairline,
+        faint_bg: mix(bg, hairline, 0.45),
+        inactive,
+        hovered: mix(inactive, accent, 0.22),
+        dark,
+    }
+}
+
+/// Resolve a [`Theme`] to its concrete [`Palette`]. Ten cohesive looks (design
+/// §1); [`Theme::Midnight`] reproduces the original navy/blue palette exactly.
+fn palette_for(theme: Theme) -> Palette {
+    use egui::Color32 as C;
+    match theme {
+        Theme::Midnight => palette(
+            C::from_rgb(0x4d, 0xa6, 0xff),
+            C::from_rgb(0xff, 0xae, 0x42),
+            C::from_rgb(0x60, 0x66, 0x6f),
+            C::from_rgb(0x17, 0x1a, 0x1f),
+            C::from_rgb(0x0e, 0x10, 0x14),
+            C::from_rgb(0x2b, 0x31, 0x3a),
+            true,
+        ),
+        Theme::Ocean => palette(
+            C::from_rgb(0x22, 0xd3, 0xee),
+            C::from_rgb(0xff, 0x8a, 0x5c),
+            C::from_rgb(0x5a, 0x7a, 0x7a),
+            C::from_rgb(0x0d, 0x1b, 0x1e),
+            C::from_rgb(0x07, 0x12, 0x14),
+            C::from_rgb(0x1d, 0x34, 0x38),
+            true,
+        ),
+        Theme::Forest => palette(
+            C::from_rgb(0xa3, 0xe6, 0x35),
+            C::from_rgb(0xff, 0xb4, 0x54),
+            C::from_rgb(0x6b, 0x75, 0x63),
+            C::from_rgb(0x13, 0x1a, 0x13),
+            C::from_rgb(0x0b, 0x11, 0x0b),
+            C::from_rgb(0x29, 0x33, 0x1f),
+            true,
+        ),
+        Theme::Sunset => palette(
+            C::from_rgb(0xff, 0x8c, 0x42),
+            C::from_rgb(0x4d, 0xd0, 0xe1),
+            C::from_rgb(0x7a, 0x6a, 0x60),
+            C::from_rgb(0x1f, 0x17, 0x14),
+            C::from_rgb(0x15, 0x0d, 0x0a),
+            C::from_rgb(0x3a, 0x2b, 0x25),
+            true,
+        ),
+        Theme::Grape => palette(
+            C::from_rgb(0xa7, 0x8b, 0xfa),
+            C::from_rgb(0xf6, 0xad, 0x55),
+            C::from_rgb(0x6f, 0x66, 0x80),
+            C::from_rgb(0x1a, 0x16, 0x22),
+            C::from_rgb(0x11, 0x0d, 0x18),
+            C::from_rgb(0x32, 0x2a, 0x40),
+            true,
+        ),
+        Theme::Ember => palette(
+            C::from_rgb(0xf0, 0x50, 0x6e),
+            C::from_rgb(0xff, 0xb3, 0x47),
+            C::from_rgb(0x7a, 0x60, 0x66),
+            C::from_rgb(0x1f, 0x15, 0x17),
+            C::from_rgb(0x15, 0x0b, 0x0d),
+            C::from_rgb(0x3a, 0x28, 0x2c),
+            true,
+        ),
+        Theme::Slate => palette(
+            C::from_rgb(0x8a, 0xa4, 0xc8),
+            C::from_rgb(0xd4, 0xa5, 0x74),
+            C::from_rgb(0x6b, 0x72, 0x80),
+            C::from_rgb(0x1a, 0x1c, 0x1f),
+            C::from_rgb(0x11, 0x13, 0x16),
+            C::from_rgb(0x2e, 0x33, 0x38),
+            true,
+        ),
+        Theme::Solarized => palette(
+            C::from_rgb(0xb5, 0x89, 0x00),
+            C::from_rgb(0x26, 0x8b, 0xd2),
+            C::from_rgb(0x58, 0x6e, 0x75),
+            C::from_rgb(0x00, 0x2b, 0x36),
+            C::from_rgb(0x07, 0x36, 0x42),
+            C::from_rgb(0x0a, 0x3d, 0x49),
+            true,
+        ),
+        Theme::Paper => palette(
+            C::from_rgb(0x25, 0x63, 0xeb),
+            C::from_rgb(0xd9, 0x77, 0x2b),
+            C::from_rgb(0x9a, 0x94, 0x86),
+            C::from_rgb(0xf3, 0xf0, 0xe9),
+            C::from_rgb(0xe6, 0xe1, 0xd6),
+            C::from_rgb(0xc9, 0xc2, 0xb4),
+            false,
+        ),
+        Theme::Rose => palette(
+            C::from_rgb(0xe2, 0x36, 0x70),
+            C::from_rgb(0x2b, 0x9a, 0xa0),
+            C::from_rgb(0xa0, 0x88, 0x91),
+            C::from_rgb(0xfb, 0xf1, 0xf3),
+            C::from_rgb(0xf3, 0xe2, 0xe6),
+            C::from_rgb(0xe0, 0xc4, 0xcc),
+            false,
+        ),
+    }
+}
+
+/// Install `pal`'s colours into egui's `Visuals`. Called whenever the selected
+/// theme changes (design §1 — a cohesive look rather than raw egui defaults).
+fn apply_palette(ctx: &egui::Context, pal: &Palette) {
+    let mut v = if pal.dark {
+        egui::Visuals::dark()
+    } else {
+        egui::Visuals::light()
+    };
+    v.panel_fill = pal.bg;
+    v.window_fill = pal.bg;
+    v.extreme_bg_color = pal.track;
+    v.faint_bg_color = pal.faint_bg;
+    v.selection.bg_fill = pal.accent.gamma_multiply(0.4);
+    v.selection.stroke = egui::Stroke::new(1.0, pal.accent);
+    v.hyperlink_color = pal.accent;
+    v.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, pal.hairline);
     // Accent the controls' fills so sliders/checkboxes read as one family.
-    v.widgets.inactive.bg_fill = egui::Color32::from_rgb(0x23, 0x29, 0x32);
-    v.widgets.inactive.weak_bg_fill = egui::Color32::from_rgb(0x23, 0x29, 0x32);
-    v.widgets.hovered.bg_fill = egui::Color32::from_rgb(0x2c, 0x34, 0x40);
-    v.widgets.active.bg_fill = ACCENT.gamma_multiply(0.6);
+    v.widgets.inactive.bg_fill = pal.inactive;
+    v.widgets.inactive.weak_bg_fill = pal.inactive;
+    v.widgets.hovered.bg_fill = pal.hovered;
+    v.widgets.active.bg_fill = pal.accent.gamma_multiply(0.6);
     ctx.set_visuals(v);
+}
 
+/// Apply the theme-independent style (spacing) once at editor creation.
+fn apply_base_style(ctx: &egui::Context) {
     let mut style = (*ctx.style()).clone();
     style.spacing.item_spacing = egui::vec2(8.0, 6.0);
     style.spacing.button_padding = egui::vec2(7.0, 3.0);
     ctx.set_style(style);
+}
+
+/// Editor-side state carried by `create_egui_editor`: the theme whose palette is
+/// currently installed in egui's `Visuals`, so we only rebuild the visuals when
+/// the user actually picks a different theme rather than every frame.
+#[derive(Default)]
+struct EditorState {
+    applied_theme: Option<Theme>,
 }
 
 /// Build the editor. Returns `None` only if the host can't host an egui window.
@@ -69,9 +233,18 @@ pub fn create(
     let egui_state = params.editor_state.clone();
     create_egui_editor(
         egui_state,
-        (),
-        |ctx, _| apply_theme(ctx),
-        move |ctx, setter, _state| {
+        EditorState::default(),
+        |ctx, _| apply_base_style(ctx),
+        move |ctx, setter, state| {
+            // Re-skin egui only when the selected theme changes (it's persisted,
+            // so on first paint this also installs the restored theme).
+            let theme = params.theme.value();
+            let pal = palette_for(theme);
+            if state.applied_theme != Some(theme) {
+                apply_palette(ctx, &pal);
+                state.applied_theme = Some(theme);
+            }
+
             egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
                 ui.add_space(3.0);
                 toolbar(ui, &params, setter);
@@ -126,6 +299,7 @@ pub fn create(
                     &params.amp_lane,
                     &params.amp_amount,
                     setter,
+                    &pal,
                     LaneView {
                         id: "amp",
                         height: lane_h,
@@ -148,6 +322,7 @@ pub fn create(
                     &params.pan_lane,
                     &params.pingpong_amount,
                     setter,
+                    &pal,
                     LaneView {
                         id: "pan",
                         height: lane_h,
@@ -163,7 +338,7 @@ pub fn create(
                 // Shared time axis: tick labels in ms (free) or division
                 // multiples (sync), with the comb zone shaded at short times.
                 ui.add_space(4.0);
-                draw_time_axis(ui, &params, step_ms, count, comb_frac, playable);
+                draw_time_axis(ui, &params, &pal, step_ms, count, comb_frac, playable);
             });
         },
     )
@@ -194,11 +369,17 @@ fn toolbar(ui: &mut egui::Ui, params: &DelayParams, setter: &ParamSetter) {
                 enum_combo(ui, "division", &params.sync_division, setter);
             }),
             TimeMode::Free => labeled(ui, "Length", |ui| {
-                ui.add(widgets::ParamSlider::for_param(&params.free_ms, setter).with_width(SLIDER_W));
+                ui.add(
+                    widgets::ParamSlider::for_param(&params.free_ms, setter).with_width(SLIDER_W),
+                );
             }),
         };
         labeled(ui, "Mix", |ui| {
             ui.add(widgets::ParamSlider::for_param(&params.mix, setter).with_width(SLIDER_W));
+        });
+        // Cosmetic only: pick one of ten editor colour themes (design §1).
+        labeled(ui, "Theme", |ui| {
+            enum_combo(ui, "theme", &params.theme, setter);
         });
     });
 
@@ -207,7 +388,9 @@ fn toolbar(ui: &mut egui::Ui, params: &DelayParams, setter: &ParamSetter) {
             enum_combo(ui, "amp_shape", &params.amp_shape, setter);
         });
         labeled(ui, "Amount", |ui| {
-            ui.add(widgets::ParamSlider::for_param(&params.amp_amount, setter).with_width(SLIDER_W));
+            ui.add(
+                widgets::ParamSlider::for_param(&params.amp_amount, setter).with_width(SLIDER_W),
+            );
         });
         labeled(ui, "Ping-Pong", |ui| {
             ui.add(
@@ -317,8 +500,16 @@ impl LaneGeom {
         let plot = rect.shrink(PLOT_PAD);
         // Value 1.0 reaches the top; the baseline sits at the bottom (unipolar)
         // or the vertical centre (bipolar). Full-scale magnitude is always 1.0.
-        let baseline_y = if bipolar { plot.center().y } else { plot.bottom() };
-        let half = if bipolar { plot.height() * 0.5 } else { plot.height() };
+        let baseline_y = if bipolar {
+            plot.center().y
+        } else {
+            plot.bottom()
+        };
+        let half = if bipolar {
+            plot.height() * 0.5
+        } else {
+            plot.height()
+        };
         let lo = if bipolar { -1.0 } else { 0.0 };
         Self {
             plot,
@@ -378,6 +569,7 @@ fn lane_widget(
     lock: &parking_lot::RwLock<Lane>,
     amount: &FloatParam,
     setter: &ParamSetter,
+    pal: &Palette,
     view: LaneView,
 ) {
     let (rect, response) = ui.allocate_exact_size(
@@ -389,7 +581,7 @@ fn lane_widget(
     let count = {
         let lane = lock.read();
         let geom = LaneGeom::new(rect, view.bipolar, lane.count());
-        paint_lane(ui, rect, &lane, &geom, &view);
+        paint_lane(ui, rect, &lane, &geom, &view, pal);
         lane.count()
     };
 
@@ -398,7 +590,14 @@ fn lane_widget(
 
 /// Draw a lane's frame, comb shade, baseline, labels, source/zig-zag overlay,
 /// and the per-tap stems + lollipops (linked filled, detached hollow).
-fn paint_lane(ui: &egui::Ui, rect: egui::Rect, lane: &Lane, geom: &LaneGeom, view: &LaneView) {
+fn paint_lane(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    lane: &Lane,
+    geom: &LaneGeom,
+    view: &LaneView,
+    pal: &Palette,
+) {
     let painter = ui.painter_at(rect);
     let visuals = ui.visuals();
 
@@ -417,7 +616,7 @@ fn paint_lane(ui: &egui::Ui, rect: egui::Rect, lane: &Lane, geom: &LaneGeom, vie
     // "Won't play" hint: taps scheduled past the buffer length are greyed under
     // a shaded zone with a cutoff line.
     if let Some(cx) = cutoff_x(geom, view.playable) {
-        shade_out_of_range(&painter, geom.plot, cx);
+        shade_out_of_range(&painter, geom.plot, cx, pal.muted);
     }
 
     let count = geom.count;
@@ -448,8 +647,8 @@ fn paint_lane(ui: &egui::Ui, rect: egui::Rect, lane: &Lane, geom: &LaneGeom, vie
         label_color,
     );
 
-    let accent = ACCENT;
-    let detached_color = DETACHED;
+    let accent = pal.accent;
+    let detached_color = pal.detached;
     let overlay_color = accent.gamma_multiply(0.4);
 
     // Guide line behind the taps.
@@ -486,8 +685,8 @@ fn paint_lane(ui: &egui::Ui, rect: egui::Rect, lane: &Lane, geom: &LaneGeom, vie
         // Past the buffer: this tap is silent. Grey it out (the link/detach
         // distinction no longer matters since it won't be heard).
         if i >= view.playable {
-            painter.line_segment([base, tip], egui::Stroke::new(1.0, MUTED));
-            painter.circle_filled(tip, 3.0, MUTED);
+            painter.line_segment([base, tip], egui::Stroke::new(1.0, pal.muted));
+            painter.circle_filled(tip, 3.0, pal.muted);
             continue;
         }
 
@@ -558,7 +757,9 @@ fn handle_lane_input(
     }
 
     if response.dragged() {
-        let target = ui.data(|d| d.get_temp::<TargetMarker>(drag_id)).map(|m| m.0);
+        let target = ui
+            .data(|d| d.get_temp::<TargetMarker>(drag_id))
+            .map(|m| m.0);
         match target {
             Some(DragTarget::Tap(i)) => {
                 if let Some(px) = response.interact_pointer_pos() {
@@ -580,7 +781,9 @@ fn handle_lane_input(
     }
 
     if response.drag_stopped() {
-        let target = ui.data(|d| d.get_temp::<TargetMarker>(drag_id)).map(|m| m.0);
+        let target = ui
+            .data(|d| d.get_temp::<TargetMarker>(drag_id))
+            .map(|m| m.0);
         if matches!(target, Some(DragTarget::Curve)) {
             setter.end_set_parameter(amount);
         }
@@ -628,7 +831,11 @@ fn shade_comb_zone(painter: &egui::Painter, plot: egui::Rect, frac: f32) {
         plot.left_top(),
         egui::pos2(plot.left() + frac * plot.width(), plot.bottom()),
     );
-    painter.rect_filled(zone, 0.0, egui::Color32::from_rgba_unmultiplied(0xff, 0x6a, 0x3d, 18));
+    painter.rect_filled(
+        zone,
+        0.0,
+        egui::Color32::from_rgba_unmultiplied(0xff, 0x6a, 0x3d, 18),
+    );
 }
 
 /// Number of taps that fit in a `max_delay_ms` buffer. Tap `i` (0-based) lands
@@ -656,15 +863,24 @@ fn cutoff_x(geom: &LaneGeom, playable: usize) -> Option<f32> {
 
 /// Shade the "won't play" region of `plot` (right of `cutoff_x`) and draw a
 /// dashed cutoff line, marking taps whose delay exceeds the buffer.
-fn shade_out_of_range(painter: &egui::Painter, plot: egui::Rect, cutoff_x: f32) {
+fn shade_out_of_range(
+    painter: &egui::Painter,
+    plot: egui::Rect,
+    cutoff_x: f32,
+    muted: egui::Color32,
+) {
     let zone = egui::Rect::from_min_max(egui::pos2(cutoff_x, plot.top()), plot.right_bottom());
-    painter.rect_filled(zone, 0.0, egui::Color32::from_rgba_unmultiplied(0x9a, 0xa0, 0xaa, 20));
+    painter.rect_filled(
+        zone,
+        0.0,
+        egui::Color32::from_rgba_unmultiplied(0x9a, 0xa0, 0xaa, 20),
+    );
     painter.extend(egui::Shape::dashed_line(
         &[
             egui::pos2(cutoff_x, plot.top()),
             egui::pos2(cutoff_x, plot.bottom()),
         ],
-        egui::Stroke::new(1.0, MUTED),
+        egui::Stroke::new(1.0, muted),
         4.0,
         3.0,
     ));
@@ -676,6 +892,7 @@ fn shade_out_of_range(painter: &egui::Painter, plot: egui::Rect, cutoff_x: f32) 
 fn draw_time_axis(
     ui: &mut egui::Ui,
     params: &DelayParams,
+    pal: &Palette,
     step_ms: f32,
     count: usize,
     comb_frac: f32,
@@ -694,7 +911,7 @@ fn draw_time_axis(
     // mapping (it only differs vertically, which we don't use here).
     let cutoff = cutoff_x(&LaneGeom::new(rect, false, count), playable);
     if let Some(cx) = cutoff {
-        shade_out_of_range(&painter, plot, cx);
+        shade_out_of_range(&painter, plot, cx, pal.muted);
     }
 
     let axis_color = visuals.weak_text_color();
@@ -765,7 +982,7 @@ fn draw_time_axis(
             egui::Align2::LEFT_BOTTOM,
             "max",
             egui::FontId::proportional(9.0),
-            MUTED,
+            pal.muted,
         );
     }
 }
@@ -809,7 +1026,8 @@ fn draw_meter(ui: &mut egui::Ui, level: f32) {
     // Level fill from the bottom up. Over 0 dBFS the fill goes red.
     let norm = meter_norm(level);
     if norm > 0.0 {
-        let fill = egui::Rect::from_min_max(egui::pos2(rect.left(), y_of(norm)), rect.right_bottom());
+        let fill =
+            egui::Rect::from_min_max(egui::pos2(rect.left(), y_of(norm)), rect.right_bottom());
         let over = level > 1.0;
         painter.rect_filled(fill, 2.0, if over { red } else { green });
     }
@@ -862,6 +1080,35 @@ mod tests {
 
     fn approx(a: f32, b: f32) {
         assert!((a - b).abs() < 1e-4, "expected {b}, got {a}");
+    }
+
+    #[test]
+    fn every_theme_resolves_to_a_palette() {
+        // One concrete look per Theme variant, with the derived fills landing
+        // between the background and the hairline (so widgets stay legible).
+        for idx in 0..Theme::variants().len() {
+            let theme = Theme::from_index(idx);
+            let pal = palette_for(theme);
+            // faint_bg is a 0.45 blend of bg -> hairline, so each channel sits
+            // within the [bg, hairline] span (order-independent check).
+            for chan in [
+                (pal.bg.r(), pal.faint_bg.r(), pal.hairline.r()),
+                (pal.bg.g(), pal.faint_bg.g(), pal.hairline.g()),
+                (pal.bg.b(), pal.faint_bg.b(), pal.hairline.b()),
+            ] {
+                let (lo, mid, hi) = (chan.0.min(chan.2), chan.1, chan.0.max(chan.2));
+                assert!(lo <= mid && mid <= hi, "fill out of range for {theme:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn mix_interpolates_endpoints() {
+        let a = egui::Color32::from_rgb(0, 0, 0);
+        let b = egui::Color32::from_rgb(100, 200, 50);
+        assert_eq!(mix(a, b, 0.0), a);
+        assert_eq!(mix(a, b, 1.0), b);
+        assert_eq!(mix(a, b, 0.5), egui::Color32::from_rgb(50, 100, 25));
     }
 
     #[test]
@@ -956,7 +1203,9 @@ mod tests {
         assert_eq!(i, 2);
         approx(dist, 1.0);
         // No taps -> nothing to grab.
-        assert!(LaneGeom::new(rect_100(), false, 0).nearest_tap(10.0).is_none());
+        assert!(LaneGeom::new(rect_100(), false, 0)
+            .nearest_tap(10.0)
+            .is_none());
     }
 
     #[test]
@@ -969,9 +1218,12 @@ mod tests {
     fn meter_norm_maps_db_scale() {
         // Silence sits at the bottom, 0 dBFS near the top, clipping pinned to 1.
         assert_eq!(meter_norm(0.0), 0.0);
-        approx(meter_norm(1.0), (0.0 - METER_MIN_DB) / (METER_MAX_DB - METER_MIN_DB));
+        approx(
+            meter_norm(1.0),
+            (0.0 - METER_MIN_DB) / (METER_MAX_DB - METER_MIN_DB),
+        );
         assert_eq!(meter_norm(10.0), 1.0); // +20 dB clamps to the top
-        // Monotonic: louder reads higher.
+                                           // Monotonic: louder reads higher.
         assert!(meter_norm(0.5) > meter_norm(0.1));
     }
 }

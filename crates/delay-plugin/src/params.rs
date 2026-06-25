@@ -100,6 +100,34 @@ impl AmpShape {
     }
 }
 
+/// Editor colour theme (design §1). Purely cosmetic: the choice only drives the
+/// editor's palette ([`crate::editor`]), never the audio. Persisted like any
+/// other param so a saved project reopens with its theme. The default —
+/// [`Theme::Midnight`] — is the original navy/blue look.
+#[derive(Enum, Debug, PartialEq, Eq, Clone, Copy)]
+pub enum Theme {
+    /// Navy background, blue accent — the original look.
+    Midnight,
+    /// Deep teal with a cyan accent.
+    Ocean,
+    /// Dark green with a lime accent.
+    Forest,
+    /// Warm charcoal with an orange accent.
+    Sunset,
+    /// Near-black with a violet accent.
+    Grape,
+    /// Dark slate with a crimson accent.
+    Ember,
+    /// Neutral greyscale, cool steel accent.
+    Slate,
+    /// Muted retro palette, amber accent.
+    Solarized,
+    /// Light "paper" theme with a blue accent.
+    Paper,
+    /// Light theme with a rose accent.
+    Rose,
+}
+
 /// Default tap count, shared by the params and the initial lanes so they agree.
 pub const DEFAULT_TAPS: i32 = 8;
 
@@ -143,6 +171,9 @@ pub struct DelayParams {
 
     #[id = "limiter"]
     pub limiter: BoolParam,
+
+    #[id = "theme"]
+    pub theme: EnumParam<Theme>,
 
     #[id = "ampshape"]
     pub amp_shape: EnumParam<AmpShape>,
@@ -211,6 +242,8 @@ impl Default for DelayParams {
 
             limiter: BoolParam::new("Limiter", false),
 
+            theme: EnumParam::new("Theme", Theme::Midnight),
+
             amp_shape: EnumParam::new("Amp Shape", AmpShape::ExpDecay),
             amp_amount: FloatParam::new("Amp Amount", 0.5, FloatRange::Linear { min: 0.0, max: 1.0 })
                 .with_value_to_string(formatters::v2s_f32_percentage(0))
@@ -237,6 +270,14 @@ mod tests {
         assert_eq!(NoteDivision::Sixteenth.beats(), 0.25);
         assert_eq!(NoteDivision::DottedEighth.beats(), 0.75);
         assert!((NoteDivision::EighthTriplet.beats() - 1.0 / 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn theme_offers_ten_choices() {
+        // The feature promises a palette of ten; the editor maps each to a
+        // concrete colour set, so keep the count in lock-step with that match.
+        assert_eq!(Theme::variants().len(), 10);
+        assert_eq!(DelayParams::default().theme.value(), Theme::Midnight);
     }
 
     #[test]
