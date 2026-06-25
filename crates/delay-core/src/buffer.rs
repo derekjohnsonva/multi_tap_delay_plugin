@@ -69,9 +69,13 @@ impl DelayLine {
         }
         let delay = delay_samples.max(0.0);
 
-        let d_floor = delay.floor();
-        let frac = delay - d_floor;
-        let i0 = d_floor as usize; // newer neighbour (older is one slot behind)
+        // `delay` is non-negative here, so truncating toward zero (`as usize`)
+        // equals flooring — but it's a single convert instead of `f32::floor`,
+        // which without SSE4.1's `roundss` expands to ~10 SSE instructions to
+        // handle the negative case we've already ruled out. This runs once per
+        // tap per sample, so the difference is real at high tap counts.
+        let i0 = delay as usize; // floor (newer neighbour; older is one slot behind)
+        let frac = delay - i0 as f32;
 
         // Most recent sample sits at write_pos - 1; walk backwards from there.
         // Bias by 2*len so the subtraction never underflows usize.
