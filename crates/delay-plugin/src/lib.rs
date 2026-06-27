@@ -95,6 +95,11 @@ impl DelayPlugin {
         amp.set_range(amp_range.0, amp_range.1);
         amp.set_source(amp_source);
         amp.set_count(count);
+        // Pan is bipolar (hard L .. hard R). The lane's range must be re-applied
+        // every block: a persisted pan lane deserializes with a placeholder
+        // unipolar (0, 1) range, which would clamp every left tap to centre and
+        // leave only right-panned taps audible.
+        pan.set_range(-1.0, 1.0);
         pan.set_source(pan_source);
         pan.set_count(count);
 
